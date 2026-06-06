@@ -2,56 +2,71 @@
 
 A RAG pipeline that answers Medicare coverage policy questions by retrieving from CMS National Coverage Determinations (NCDs) and Local Coverage Determinations (LCDs).
 
-## Overview
-
-This agent lets users ask natural-language questions about Medicare coverage policies and receive grounded, cited answers drawn from official CMS documents.
-
 ## Tech Stack
 
 - **Python 3.11+**
 - **LangChain** — orchestration and RAG pipeline
-- **ChromaDB** — local vector store for document embeddings
-- **OpenAI** — `text-embedding-3-small` for embeddings, `GPT-4o` for generation
+- **ChromaDB** — local vector store
+- **HuggingFace** — `BAAI/bge-small-en-v1.5` for embeddings
+- **Groq** — `llama-3.1-8b-instant` for generation and evaluation
 - **Streamlit** — web UI
-- **RAGAS** — RAG evaluation (faithfulness, answer relevancy)
+- **RAGAS** — evaluation (faithfulness, answer relevancy)
 
 ## Project Structure
 
 ```
 src/ingestion/   CMS data fetching and parsing
 src/rag/         Embedding, indexing, and retrieval pipeline
-src/evaluation/  Faithfulness judge and golden dataset
+src/evaluation/  Golden dataset generation and RAGAS evaluation
 src/ui/          Streamlit app
-data/            Raw JSON fetched from CMS
-logs/            JSONL interaction logs
+data/            Raw JSON fetched from CMS (gitignored)
+logs/            JSONL interaction logs (gitignored)
 tests/           Unit tests
 ```
 
 ## Setup
 
-1. Clone the repo and install dependencies:
+1. Create and activate the virtual environment:
+   ```bash
+   python -m venv agent
+   agent\Scripts\activate   # Windows
+   ```
+
+2. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
 
-2. Copy `.env.example` to `.env` and fill in your API keys:
-   ```bash
-   cp .env.example .env
+3. Create a `.env` file with your API key:
+   ```
+   GROQ_API_KEY=your_groq_api_key
    ```
 
-3. Ingest CMS data:
+4. Ingest CMS data:
    ```bash
    python -m src.ingestion.fetch
    ```
 
-4. Launch the UI:
+5. Generate the golden evaluation dataset (200 samples):
+   ```bash
+   python -m src.evaluation.generate_golden
+   ```
+
+6. Launch the UI:
    ```bash
    streamlit run src/ui/app.py
    ```
+
+## Evaluation
+
+Run RAGAS faithfulness and answer relevancy scoring against the golden dataset:
+
+```bash
+python -m src.evaluation.judge
+```
 
 ## Environment Variables
 
 | Variable | Description |
 |---|---|
-| `OPENAI_API_KEY` | OpenAI API key for embeddings and generation |
-| `ANTHROPIC_API_KEY` | Anthropic API key (optional, for evaluation judges) |
+| `GROQ_API_KEY` | Groq API key for generation and evaluation |

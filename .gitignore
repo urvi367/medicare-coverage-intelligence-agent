@@ -8,3 +8,4 @@ logs/
 .venv/
 venv/
 agent/
+*.docx
