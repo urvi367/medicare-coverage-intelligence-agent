@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.chroma/
+data/
+logs/
+.venv/
+venv/
+agent/

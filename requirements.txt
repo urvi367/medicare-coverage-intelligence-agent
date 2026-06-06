@@ -1,0 +1,12 @@
+langchain
+langchain-groq
+langchain-community
+langchain-chroma
+langchain-text-splitters
+chromadb
+sentence-transformers
+streamlit
+requests
+python-dotenv
+ragas>=0.2
+datasets
