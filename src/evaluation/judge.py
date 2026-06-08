@@ -2,9 +2,11 @@
 
 import json
 import logging
-import os
+import random
+import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -18,6 +20,8 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 GOLDEN_PATH = Path(__file__).parents[2] / "data" / "golden_dataset.json"
+ANSWERS_CACHE_PATH = Path(__file__).parents[2] / "logs" / "rag_answers_cache.json"
+EVAL_LOG_PATH = Path(__file__).parents[2] / "logs" / "eval_results.jsonl"
 
 
 def load_golden_dataset() -> list[dict[str, str]]:
@@ -44,12 +48,13 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
     Returns:
         Dict of metric name → score.
     """
-    from langchain_community.embeddings import HuggingFaceEmbeddings
-    from langchain_groq import ChatGroq
+    import pandas as pd
+    from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
     from ragas import EvaluationDataset, SingleTurnSample, evaluate as ragas_evaluate
     from ragas.embeddings import LangchainEmbeddingsWrapper
     from ragas.llms import LangchainLLMWrapper
     from ragas.metrics._answer_relevance import AnswerRelevancy
+    from ragas.metrics._context_precision import LLMContextPrecisionWithoutReference
     from ragas.metrics._faithfulness import Faithfulness
 
     from src.rag.pipeline import answer as rag_answer
@@ -58,55 +63,106 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
     if n_samples:
         golden = golden[:n_samples]
 
-    def _rag_answer_with_retry(question: str, max_retries: int = 5) -> dict:
-        from groq import RateLimitError
-        for attempt in range(max_retries):
-            try:
-                return rag_answer(question)
-            except RateLimitError as e:
-                retry_after = getattr(e.response, "headers", {}).get("retry-after")
-                wait = int(float(retry_after)) + 1 if retry_after else 60 * (attempt + 1)
-                logger.warning("Rate limited on RAG call — waiting %ds (attempt %d/%d)", wait, attempt + 1, max_retries)
-                time.sleep(wait)
-        raise RuntimeError(f"Exhausted retries for question: {question}")
+    # Filter out LCD entries until jurisdiction handling is implemented.
+    # Entries pre-dating the document_type field are assumed NCD-safe (requires_jurisdiction=False).
+    pre_filter = len(golden)
+    golden = [item for item in golden if not item.get("requires_jurisdiction", False)]
+    skipped_jurisdiction = pre_filter - len(golden)
+    if skipped_jurisdiction:
+        logger.info(
+            "Skipped %d/%d entries with requires_jurisdiction=True (LCD jurisdiction handling not yet implemented). "
+            "Coverage gap: %.0f%% of dataset excluded.",
+            skipped_jurisdiction, pre_filter,
+            100 * skipped_jurisdiction / pre_filter,
+        )
 
-    # llama-3.3-70b-versatile free tier: 12K TPM, ~800 tok/request → max ~15 req/min → 5s delay
-    _EVAL_DELAY = 5.0
+    # --- persistent answer cache: skip questions already answered in any prior run ---
+    if ANSWERS_CACHE_PATH.exists():
+        cached: list[dict] = json.loads(ANSWERS_CACHE_PATH.read_text(encoding="utf-8"))
+        logger.info("Loaded answer cache: %d questions already answered", len(cached))
+    else:
+        cached = []
 
-    samples = []
+    cached_questions = {item["user_input"] for item in cached}
+
+    # gemini-2.5-flash free tier: 10 RPM → 7s gap keeps us well under the limit
+    _ANSWER_DELAY = 7.0
+    answered_count = 0
+
     for i, item in enumerate(golden, 1):
+        if item["question"] in cached_questions:
+            logger.info("  Skipping [%d/%d] (cached): %s", i, len(golden), item["question"][:80])
+            continue
+        if answered_count > 0:
+            time.sleep(_ANSWER_DELAY)
         logger.info("  Answering [%d/%d]: %s", i, len(golden), item["question"][:80])
-        result = _rag_answer_with_retry(item["question"])
-        samples.append(SingleTurnSample(
-            user_input=item["question"],
-            response=result["answer"],
-            retrieved_contexts=[s.page_content for s in result["sources"]],
-            reference=item["reference_answer"],
-        ))
-        time.sleep(_EVAL_DELAY)
+        result = rag_answer(item["question"])
+        answered_count += 1
+        cached.append({
+            "user_input": item["question"],
+            "response": result["answer"],
+            "retrieved_contexts": [s.page_content for s in result["sources"]],
+            "reference": item["reference_answer"],
+        })
+        ANSWERS_CACHE_PATH.write_text(json.dumps(cached, indent=2), encoding="utf-8")
 
-    dataset = EvaluationDataset(samples=samples)
+    samples = [SingleTurnSample(**item) for item in cached]
 
-    # bypass_n=True: Groq rejects n>1 in a single API call (400 error).
-    # This makes RAGAS send n separate requests (each n=1) instead.
     llm = LangchainLLMWrapper(
-        ChatGroq(model="llama-3.1-8b-instant", temperature=0, api_key=os.environ["GROQ_API_KEY"]),
-        bypass_n=True,
+        ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0),
     )
     emb = LangchainEmbeddingsWrapper(
-        HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+        GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
     )
 
     metrics = [
         Faithfulness(llm=llm),
         AnswerRelevancy(llm=llm, embeddings=emb),
+        LLMContextPrecisionWithoutReference(llm=llm),
     ]
 
-    result = ragas_evaluate(dataset, metrics=metrics)
-    df = result.to_pandas()
+    # gemini-2.5-flash-lite free tier: 10 RPM → 7s between samples stays within limit
+    _JUDGE_DELAY = 7.0
+
+    def _judge_retry_delay(exc: BaseException) -> float | None:
+        m = re.search(r"retryDelay['\"]:\s*['\"](\d+(?:\.\d+)?)s", str(exc))
+        return float(m.group(1)) if m else None
+
+    def _judge_retryable(exc: BaseException) -> bool:
+        s = str(exc)
+        return bool(_judge_retry_delay(exc)) or any(
+            t in s for t in ("429", "RESOURCE_EXHAUSTED", "503", "SERVICE_UNAVAILABLE")
+        )
+
+    dfs = []
+    for i, sample in enumerate(samples, 1):
+        if i > 1:
+            time.sleep(_JUDGE_DELAY)
+        logger.info("  Judging [%d/%d]", i, len(samples))
+        single = EvaluationDataset(samples=[sample])
+        for attempt in range(10):
+            try:
+                res = ragas_evaluate(single, metrics=metrics)
+                break
+            except Exception as exc:
+                if not _judge_retryable(exc) or attempt == 9:
+                    raise
+                delay = _judge_retry_delay(exc)
+                wait = (delay + random.uniform(1, 3)) if delay else min(2 ** attempt * 10 + random.uniform(0, 2), 120)
+                logger.warning("Judge rate limited (attempt %d/10) — waiting %.0fs", attempt + 1, wait)
+                time.sleep(wait)
+        dfs.append(res.to_pandas())
+
+    df = pd.concat(dfs, ignore_index=True)
     skip = {"user_input", "retrieved_contexts", "response", "reference"}
     scores = {col: round(float(df[col].mean(skipna=True)), 3) for col in df.columns if col not in skip}
     logger.info("Evaluation scores: %s", scores)
+
+    # persist scores and clean up checkpoint
+    EVAL_LOG_PATH.parent.mkdir(exist_ok=True)
+    with EVAL_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), **scores}) + "\n")
+
     return scores
 
 
