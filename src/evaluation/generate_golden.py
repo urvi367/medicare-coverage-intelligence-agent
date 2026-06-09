@@ -58,7 +58,6 @@ def _generate_pair(client: Groq, doc: dict, max_retries: int = 5) -> dict | None
             pair["policy_number"] = doc.get("policy_number", "")
             pair["title"] = doc.get("title", "")
             pair["source"] = doc.get("source", "")
-            pair["document_type"] = doc.get("source", "")  # "NCD" or "LCD"
             pair["requires_jurisdiction"] = doc.get("source", "") == "LCD"
             return pair
         except RateLimitError as e:
@@ -102,7 +101,7 @@ def generate(
 
     Returns:
         List of dicts with keys: question, reference_answer, title, policy_number,
-        source, document_type ("NCD" or "LCD"), requires_jurisdiction (bool).
+        source, requires_jurisdiction (bool).
     """
     client = Groq(api_key=os.environ["GROQ_API_KEY"])
 

@@ -20,8 +20,9 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 GOLDEN_PATH = Path(__file__).parents[2] / "data" / "golden_dataset.json"
-ANSWERS_CACHE_PATH = Path(__file__).parents[2] / "logs" / "rag_answers_cache.json"
+ANSWERS_CACHE_PATH = Path(__file__).parents[2] / "logs" / "rag_answers_cache_k5_threshold0.7_reranked.json"
 EVAL_LOG_PATH = Path(__file__).parents[2] / "logs" / "eval_results.jsonl"
+EVAL_SAMPLES_PATH = Path(__file__).parents[2] / "logs" / "eval_samples_latest.json"
 
 
 def load_golden_dataset() -> list[dict[str, str]]:
@@ -58,14 +59,14 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
     from ragas.metrics._context_precision import LLMContextPrecisionWithoutReference
     from ragas.metrics._faithfulness import Faithfulness
 
-    from src.rag.pipeline import answer as rag_answer
+    from src.rag.pipeline import answer as rag_answer, PIPELINE_CONFIG
 
     golden = load_golden_dataset()
     if n_samples:
         golden = golden[:n_samples]
 
     # Filter out LCD entries until jurisdiction handling is implemented.
-    # Entries pre-dating the document_type field are assumed NCD-safe (requires_jurisdiction=False).
+    # Entries without requires_jurisdiction (pre-dating the field) are assumed NCD-safe.
     pre_filter = len(golden)
     golden = [item for item in golden if not item.get("requires_jurisdiction", False)]
     skipped_jurisdiction = pre_filter - len(golden)
@@ -103,11 +104,53 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
             "user_input": item["question"],
             "response": result["answer"],
             "retrieved_contexts": [s.page_content for s in result["sources"]],
+            "source_policy_numbers": [
+                s.metadata["policy_number"]
+                for s in result["sources"]
+                if s.metadata.get("policy_number")
+            ],
             "reference": item["reference_answer"],
         })
         ANSWERS_CACHE_PATH.write_text(json.dumps(cached, indent=2), encoding="utf-8")
 
-    samples = [SingleTurnSample(**item) for item in cached]
+    def _extract_policy_numbers(text: str) -> set[str]:
+        lcd = set(re.findall(r'\bL\d{4,6}\b', text))
+        # NCD decimal format: 20.4, 160.6.1 — 2-digit prefix avoids short false positives
+        ncd = set(re.findall(r'\b\d{2,3}\.\d{1,2}(?:\.\d{1,2})*\b', text))
+        return lcd | ncd
+
+    def _citation_accuracy(item: dict) -> float:
+        resp = item["response"]
+        stored = [pn for pn in item.get("source_policy_numbers", []) if pn]
+        if stored:
+            return 1.0 if any(pn in resp for pn in stored) else 0.0
+        # Fallback for old cache entries: regex cross-check on page_content
+        ctx_nums = _extract_policy_numbers(" ".join(item["retrieved_contexts"]))
+        return 1.0 if (_extract_policy_numbers(resp) & ctx_nums) else 0.0
+
+    # restrict evaluation to NCD golden questions only — exclude legacy LCD cache entries
+    ncd_questions = {item["question"] for item in golden}
+    eval_cache = [item for item in cached if item["user_input"] in ncd_questions]
+    logger.info("Evaluating %d/%d cached entries (NCD golden set only)", len(eval_cache), len(cached))
+
+    extra_rows = []
+    for item in eval_cache:
+        extra_rows.append({
+            "user_input": item["user_input"],
+            "empty_retrieval": 1.0 if not item["retrieved_contexts"] else 0.0,
+            "citation_accuracy": _citation_accuracy(item),
+        })
+
+    # only the 4 RAGAS-required fields go into SingleTurnSample
+    samples = [
+        SingleTurnSample(
+            user_input=item["user_input"],
+            response=item["response"],
+            retrieved_contexts=item["retrieved_contexts"],
+            reference=item["reference"],
+        )
+        for item in eval_cache
+    ]
 
     # bypass_n=True: Gemini ignores n>1 and returns 1 generation; this makes RAGAS
     # send n separate single requests instead of one n=3 request.
@@ -159,14 +202,22 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
         dfs.append(res.to_pandas())
 
     df = pd.concat(dfs, ignore_index=True)
+    df = df.merge(pd.DataFrame(extra_rows), on="user_input", how="left")
     skip = {"user_input", "retrieved_contexts", "response", "reference"}
     scores = {col: round(float(df[col].mean(skipna=True)), 3) for col in df.columns if col not in skip}
     logger.info("Evaluation scores: %s", scores)
 
-    # persist scores and clean up checkpoint
     EVAL_LOG_PATH.parent.mkdir(exist_ok=True)
+
+    # save per-sample rows (exclude bulky context columns for readability)
+    sample_cols = ["user_input", "response"] + [c for c in df.columns if c not in skip]
+    EVAL_SAMPLES_PATH.write_text(
+        json.dumps(df[sample_cols].to_dict(orient="records"), indent=2),
+        encoding="utf-8",
+    )
+
     with EVAL_LOG_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), **scores}) + "\n")
+        f.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), **PIPELINE_CONFIG, **scores}) + "\n")
 
     return scores
 

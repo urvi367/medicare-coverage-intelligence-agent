@@ -12,32 +12,64 @@ from langchain_google_genai.chat_models import ChatGoogleGenerativeAIError
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+from sentence_transformers import CrossEncoder
 
 from src.rag.indexer import load_index
+
+PIPELINE_CONFIG = {
+    "k": 5,
+    "threshold": 0.7,
+    "reranker": "BAAI/bge-reranker-base",
+    "reranker_top_n": 5,
+}
+
+_reranker: CrossEncoder | None = None
+
+
+def _get_reranker() -> CrossEncoder:
+    global _reranker
+    if _reranker is None:
+        _reranker = CrossEncoder("BAAI/bge-reranker-base")
+    return _reranker
+
+
+def _rerank(query: str, docs: list[Document], top_n: int = 3) -> list[Document]:
+    """Score (query, doc) pairs with a cross-encoder and return the top_n docs."""
+    if not docs:
+        return docs
+    pairs = [(query, d.page_content) for d in docs]
+    scores = _get_reranker().predict(pairs)
+    ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in ranked[:top_n]]
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-_SYSTEM = (
+_BASE_SYSTEM = (
     "You are a Medicare coverage policy expert. Answer questions using ONLY the "
     "retrieved policy documents below. For every claim, cite the document title and "
     "policy number. If the documents do not contain enough information to answer "
-    "confidently, say so explicitly.\n\n"
-    "If any retrieved document is an LCD (Local Coverage Determination), explicitly "
-    "state at the start of your answer: 'Note: This determination is based on an LCD "
-    "which applies to [jurisdiction] only. Coverage may differ in other MAC regions.' "
-    "If the jurisdiction is not known, say the jurisdiction is unknown and the user "
-    "must verify.\n\n"
-    "If both an NCD and LCD are retrieved for the same service, clearly distinguish "
-    "them: state the NCD national coverage position first, then state how the LCD adds "
-    "or modifies criteria for the specific jurisdiction.\n\n"
-    "Retrieved documents:\n{context}"
+    "confidently, say so explicitly."
 )
 
-_PROMPT = ChatPromptTemplate.from_messages(
-    [("system", _SYSTEM), ("human", "{question}")]
+_LCD_ADDENDUM = (
+    "\n\nOne or more retrieved documents are LCDs (Local Coverage Determinations). "
+    "State at the start of your answer: 'Note: This determination is based on an LCD "
+    "which applies to [jurisdiction] only. Coverage may differ in other MAC regions.' "
+    "If jurisdiction is unknown, say so and instruct the user to verify. "
+    "If both an NCD and LCD are retrieved for the same service, state the NCD national "
+    "coverage position first, then how the LCD modifies criteria for that jurisdiction."
 )
+
+
+def _build_system(docs: list[Document]) -> str:
+    """Return a system prompt with the LCD note only when LCDs are present in docs."""
+    has_lcd = any(d.metadata.get("source", "") == "LCD" for d in docs)
+    base = _BASE_SYSTEM
+    if has_lcd:
+        base += _LCD_ADDENDUM
+    return base + "\n\nRetrieved documents:\n{context}"
 
 
 def _format_docs(docs: list[Document]) -> str:
@@ -88,12 +120,20 @@ def answer(
         sources — list of source Documents used
     """
     db = load_index()
-    retriever = db.as_retriever(search_kwargs={"k": k})
+    retriever = db.as_retriever(
+        search_type="similarity_score_threshold",
+        search_kwargs={"k": k, "score_threshold": PIPELINE_CONFIG["threshold"]},
+    )
     llm = ChatGoogleGenerativeAI(model=model, temperature=0)
 
-    sources: list[Document] = retriever.invoke(question)
+    sources: list[Document] = _rerank(
+        question, retriever.invoke(question), top_n=PIPELINE_CONFIG["reranker_top_n"]
+    )
     context = _format_docs(sources)
-    prompt_value = _PROMPT.format_messages(context=context, question=question)
+    prompt = ChatPromptTemplate.from_messages(
+        [("system", _build_system(sources)), ("human", "{question}")]
+    )
+    prompt_value = prompt.format_messages(context=context, question=question)
 
     attempt = 0
     while True:
@@ -117,12 +157,22 @@ def answer(
 def build_chain(model: str = "gemini-2.5-flash", k: int = 5):
     """Return a streaming-compatible LangChain LCEL chain (answer text only)."""
     db = load_index()
-    retriever = db.as_retriever(search_kwargs={"k": k})
+    retriever = db.as_retriever(
+        search_type="similarity_score_threshold",
+        search_kwargs={"k": k, "score_threshold": PIPELINE_CONFIG["threshold"]},
+    )
     llm = ChatGoogleGenerativeAI(model=model, temperature=0)
 
+    def _build_prompt(inputs: dict):
+        docs = _rerank(inputs["question"], inputs["docs"], top_n=PIPELINE_CONFIG["reranker_top_n"])
+        prompt = ChatPromptTemplate.from_messages(
+            [("system", _build_system(docs)), ("human", "{question}")]
+        )
+        return prompt.format_messages(context=_format_docs(docs), question=inputs["question"])
+
     return (
-        {"context": retriever | _format_docs, "question": RunnablePassthrough()}
-        | _PROMPT
+        {"docs": retriever, "question": RunnablePassthrough()}
+        | RunnableLambda(_build_prompt)
         | llm
         | StrOutputParser()
     )

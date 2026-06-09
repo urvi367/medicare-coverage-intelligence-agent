@@ -1,12 +1,6 @@
 # Medicare Coverage Intelligence Agent
 
-A production-ready RAG system that answers natural-language questions about Medicare coverage policy by retrieving directly from CMS National Coverage Determinations (NCDs) and Local Coverage Determinations (LCDs). Answers are grounded, cited, and evaluated end-to-end.
-
----
-
-## Why this exists
-
-Navigating Medicare coverage policy is painful. Clinicians and patients searching for whether a procedure is covered must cross-reference dense PDF documents across hundreds of NCDs and LCDs. This agent indexes the full CMS coverage corpus and lets users ask plain-English questions, receiving cited answers in seconds.
+A RAG system that answers natural-language questions about Medicare coverage policy by retrieving directly from CMS National Coverage Determinations (NCDs) and Local Coverage Determinations (LCDs). Answers are grounded, cited, and evaluated end-to-end.
 
 ---
 
@@ -23,7 +17,6 @@ Navigating Medicare coverage policy is painful. Clinicians and patients searchin
 │                     Ingestion Layer                             │
 │  • HTML stripping + text normalization                          │
 │  • 8-worker ThreadPoolExecutor for parallel detail fetching     │
-│  • LCD license Bearer token auth                                │
 │  • Saved to data/ncd_raw.json, data/lcd_raw.json               │
 └───────────────────────────┬─────────────────────────────────────┘
                             │  load_documents()
@@ -34,30 +27,41 @@ Navigating Medicare coverage policy is painful. Clinicians and patients searchin
 │  • BAAI/bge-small-en-v1.5  — local CPU embeddings, no API cost  │
 │  • ChromaDB persisted at data/chroma/                           │
 └───────────────────────────┬─────────────────────────────────────┘
-                            │  similarity search (k=5)
+                            │  similarity search (k=5, threshold=0.7)
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   Cross-Encoder Reranker                        │
+│  • BAAI/bge-reranker-base — scores (query, chunk) pairs jointly │
+│  • Reranks k=5 candidates, keeps top 3 most relevant            │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │  top-3 reranked chunks
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                      RAG Pipeline                               │
-│  • Retrieves top-5 policy chunks                                │
-│  • Constructs cited context block                               │
-│  • llama-3.3-70b-versatile (Groq) — answer generation          │
+│  • Constructs cited context block with NCD/LCD headers          │
+│  • LCD jurisdiction note injected only when LCD retrieved       │
+│  • gemini-2.5-flash — answer generation (temperature=0)         │
+│  • Indefinite retry loop reading API retryDelay on rate limits  │
 │  • Returns answer + source Documents                            │
 └──────────┬────────────────────────────────┬─────────────────────┘
            │                                │
            ▼                                ▼
 ┌─────────────────────┐       ┌─────────────────────────────────────┐
-│    Streamlit UI      │       │         Evaluation Pipeline          │
+│    Streamlit UI     │       │         Evaluation Pipeline         │
 │  • Chat interface   │       │                                     │
 │  • Source expander  │       │  generate_golden.py                 │
-│  • JSONL logging    │       │  • llama-3.1-8b-instant generates   │
-│    of interactions  │       │    200 Q&A pairs from policy docs   │
+│  • JSONL logging    │       │  • llama-3.1-8b-instant (Groq)      │
+│    of interactions  │       │  • 198 Q&A pairs from policy docs   │
 └─────────────────────┘       │  • Incremental save + resume        │
-                              │  • Rate-limit retry w/ retry-after  │
                               │                                     │
                               │  judge.py (RAGAS)                   │
                               │  • Faithfulness                     │
                               │  • Answer Relevancy                 │
-                              │  • llama-3.1-8b-instant as judge    │
+                              │  • Context Precision                │
+                              │  • gemini-2.5-flash-lite as judge   │
+                              │  • BAAI/bge-small-en-v1.5 embeddings│
+                              │  • Persistent answer cache          │
+                              │  • NCD-only eval (LCD filtered)     │
                               └─────────────────────────────────────┘
 ```
 
@@ -65,11 +69,23 @@ Navigating Medicare coverage policy is painful. Clinicians and patients searchin
 
 | Model | Provider | Role |
 |---|---|---|
-| `llama-3.3-70b-versatile` | Groq | Answer generation in the RAG pipeline |
-| `llama-3.1-8b-instant` | Groq | Synthetic Q&A generation + LLM-as-judge (RAGAS) |
-| `BAAI/bge-small-en-v1.5` | HuggingFace (local) | Document and query embeddings |
+| `gemini-2.5-flash` | Google AI | Answer generation in the RAG pipeline |
+| `gemini-2.5-flash-lite` | Google AI | RAGAS judge (Faithfulness, Answer Relevancy, Context Precision) |
+| `llama-3.1-8b-instant` | Groq | Synthetic Q&A generation (golden dataset only) |
+| `BAAI/bge-small-en-v1.5` | HuggingFace (local) | Document and query embeddings + RAGAS Answer Relevancy embeddings |
+| `BAAI/bge-reranker-base` | HuggingFace (local) | Cross-encoder reranking of retrieved chunks |
 
-The 70b model is used where answer quality matters most. The 8b model handles high-volume, repetitive tasks (200 synthetic generations + per-question RAGAS scoring) to stay within free-tier token limits.
+---
+
+## Evaluation Results
+
+Evaluated on 79 NCD questions (LCD entries excluded — Phase 1).
+
+| k | Threshold | Faithfulness | Answer Relevancy | Context Precision |
+|:---:|:---:|:---:|:---:|:---:|
+| 5 | 0.70 | **0.923** ✅ | 0.802 | 0.784 |
+
+**Targets:** Faithfulness > 0.90 · Answer Relevancy > 0.85 · Context Precision > 0.80
 
 ---
 
@@ -78,32 +94,35 @@ The 70b model is used where answer quality matters most. The 8b model handles hi
 ```
 src/
 ├── ingestion/
-│   └── fetch.py          # CMS API client — NCDs and LCDs
+│   └── fetch.py              # CMS API client — NCDs and LCDs
 ├── rag/
-│   ├── embedder.py       # HuggingFace embedding wrapper
-│   ├── indexer.py        # ChromaDB build + load
-│   └── pipeline.py       # Retrieval + Groq generation
+│   ├── embedder.py           # HuggingFace embedding wrapper
+│   ├── indexer.py            # ChromaDB build + load
+│   └── pipeline.py           # Retrieval + reranking + Gemini generation
 ├── evaluation/
-│   ├── generate_golden.py  # Synthetic dataset generation (200 pairs)
-│   └── judge.py            # RAGAS faithfulness + answer relevancy
+│   ├── generate_golden.py    # Synthetic dataset generation (198 pairs)
+│   └── judge.py              # RAGAS evaluation pipeline
 └── ui/
-    └── app.py            # Streamlit chat interface
+    └── app.py                # Streamlit chat interface
 
-data/                     # gitignored — generated at runtime
+data/                         # gitignored — generated at runtime
 ├── ncd_raw.json
 ├── lcd_raw.json
-├── chroma/               # ChromaDB vector store
-└── golden_dataset.json   # 200-pair evaluation set
+├── chroma/                   # ChromaDB vector store
+└── golden_dataset.json       # 198-pair evaluation set (79 NCD, 119 LCD)
 
-logs/                     # gitignored — JSONL interaction logs
-tests/
+logs/                         # gitignored
+├── eval_results.jsonl        # Aggregate scores per run
+├── eval_samples_latest.json  # Per-sample scores from latest run
+├── rag_answers_cache_*.json  # Persistent answer cache (named by config)
+└── interactions.jsonl        # UI interaction log
 ```
 
 ---
 
 ## Setup
 
-**Prerequisites:** Python 3.11+, a [Groq API key](https://console.groq.com) (free tier works).
+**Prerequisites:** Python 3.11+, a Google AI API key (paid tier recommended).
 
 ### 1. Create and activate the virtual environment
 
@@ -124,12 +143,13 @@ pip install -r requirements.txt
 Create a `.env` file in the project root:
 
 ```
-GROQ_API_KEY=your_groq_api_key_here
+GOOGLE_API_KEY=your_google_api_key_here
+GROQ_API_KEY=your_groq_api_key_here   # only needed for generate_golden.py
 ```
 
 ### 4. Ingest CMS data
 
-Fetches all NCDs and LCDs from the CMS Coverage API (parallel, ~2–3 min):
+Fetches all NCDs and LCDs from the CMS Coverage API (~2–3 min):
 
 ```bash
 python -m src.ingestion.fetch
@@ -155,7 +175,7 @@ streamlit run src/ui/app.py
 
 ### Generate the golden dataset
 
-Generates 200 synthetic Q&A pairs from sampled policy documents using `llama-3.1-8b-instant`. Supports resuming across Groq free-tier daily token limits — re-running picks up exactly where it left off:
+Generates 198 synthetic Q&A pairs (79 NCD, 119 LCD) using `llama-3.1-8b-instant` via Groq. Supports resuming — re-running picks up where it left off:
 
 ```bash
 python -m src.evaluation.generate_golden
@@ -163,32 +183,13 @@ python -m src.evaluation.generate_golden
 
 ### Run RAGAS evaluation
 
-Scores the RAG pipeline on faithfulness and answer relevancy against the golden dataset:
+Scores the pipeline on the 79-question NCD subset. Answers are cached in `logs/rag_answers_cache_*.json` — already-answered questions are never re-fetched:
 
 ```bash
 python -m src.evaluation.judge
 ```
 
-Output example:
-```
-faithfulness: 0.847
-answer_relevancy: 0.912
-```
-
----
-
-## Groq Free Tier Notes
-
-The pipeline is designed to work within Groq's free tier limits:
-
-| Model | RPM | TPM | TPD |
-|---|---|---|---|
-| `llama-3.3-70b-versatile` | 30 | 12K | 100K |
-| `llama-3.1-8b-instant` | 30 | 6K | 500K |
-
-- `generate_golden.py` enforces a **10s delay** between requests and uses `retry-after` headers on 429s
-- `judge.py` enforces a **5s delay** between RAG pipeline calls during evaluation
-- Golden dataset generation is split across days if needed via incremental save
+Per-sample scores are written to `logs/eval_samples_latest.json` after each run.
 
 ---
 
@@ -196,4 +197,5 @@ The pipeline is designed to work within Groq's free tier limits:
 
 | Variable | Required | Description |
 |---|---|---|
-| `GROQ_API_KEY` | Yes | Groq API key for both generation and evaluation |
+| `GOOGLE_API_KEY` | Yes | Google AI API key — answer generation + RAGAS judge |
+| `GROQ_API_KEY` | Only for `generate_golden.py` | Groq API key for synthetic dataset generation |
