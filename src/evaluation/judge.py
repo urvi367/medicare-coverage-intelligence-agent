@@ -49,7 +49,8 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
         Dict of metric name → score.
     """
     import pandas as pd
-    from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from langchain_google_genai import ChatGoogleGenerativeAI
     from ragas import EvaluationDataset, SingleTurnSample, evaluate as ragas_evaluate
     from ragas.embeddings import LangchainEmbeddingsWrapper
     from ragas.llms import LangchainLLMWrapper
@@ -85,8 +86,8 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
 
     cached_questions = {item["user_input"] for item in cached}
 
-    # gemini-2.5-flash free tier: 10 RPM → 7s gap keeps us well under the limit
-    _ANSWER_DELAY = 7.0
+    # gemini-2.5-flash paid tier: 1000+ RPM → 1s gap is ample headroom
+    _ANSWER_DELAY = 1.0
     answered_count = 0
 
     for i, item in enumerate(golden, 1):
@@ -108,11 +109,15 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
 
     samples = [SingleTurnSample(**item) for item in cached]
 
+    # bypass_n=True: Gemini ignores n>1 and returns 1 generation; this makes RAGAS
+    # send n separate single requests instead of one n=3 request.
     llm = LangchainLLMWrapper(
         ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0),
+        bypass_n=True,
     )
+    # Use the same local model as the vector index — no API quota, no availability issues.
     emb = LangchainEmbeddingsWrapper(
-        GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+        HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
     )
 
     metrics = [
@@ -121,8 +126,8 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
         LLMContextPrecisionWithoutReference(llm=llm),
     ]
 
-    # gemini-2.5-flash-lite free tier: 10 RPM → 7s between samples stays within limit
-    _JUDGE_DELAY = 7.0
+    # gemini-2.5-flash-lite paid tier: 1000+ RPM → 1s between samples is ample headroom
+    _JUDGE_DELAY = 1.0
 
     def _judge_retry_delay(exc: BaseException) -> float | None:
         m = re.search(r"retryDelay['\"]:\s*['\"](\d+(?:\.\d+)?)s", str(exc))

@@ -13,6 +13,19 @@
 | v1.0 | 2026-03-01 | urvi367 | Initial PRD — Phase 1 architecture with Groq/llama + HuggingFace embeddings |
 | v1.1 | 2026-05-01 | urvi367 | Updated Phase 1 architecture to reflect live implementation |
 | v1.2 | 2026-06-07 | urvi367 | Switch answer generation to gemini-2.5-flash, judge to gemini-2.5-flash-lite; add Context Relevance eval metric; persistent answer cache; golden dataset gets document_type + requires_jurisdiction fields; LCD jurisdiction handled via prompt instruction (full implementation deferred to Phase 2); rate-limit retry using API retryDelay; LCD entries filtered from eval run until jurisdiction handling is complete |
+| v1.3 | 2026-06-08 | urvi367 | Add eval results history table; fix AnswerRelevancy NaN (switch RAGAS embeddings to local BAAI/bge-small-en-v1.5, add bypass_n=True for Gemini); upgrade to paid API tier, reduce inter-call delays from 7s to 1s |
+
+---
+
+## Evaluation Results History
+
+All RAGAS evaluation runs against the NCD subset of the golden dataset. Append a row after each `python -m src.evaluation.judge` run.
+
+| Date | Eval set | Faithfulness | Answer Relevancy | Context Precision | Notes |
+|------|----------|:---:|:---:|:---:|-------|
+| 2026-06-08 | 19 NCD samples | 0.867 | NaN | 0.717 | First run. Answer Relevancy NaN due to `models/text-embedding-004` 404 on v1beta endpoint + Gemini returning 1 generation instead of requested 3. Fixed in v1.3 (local BAAI embeddings + bypass_n=True). |
+
+**Targets:** Faithfulness > 0.90 · Answer Relevancy > 0.85 · Context Precision > 0.80
 
 ---
 
