@@ -27,6 +27,14 @@ PIPELINE_CONFIG = {
 
 _reranker: CrossEncoder | None = None
 _bm25: BM25Retriever | None = None
+_db = None  # cached Chroma instance — avoid reopening on every query
+
+
+def _get_db():
+    global _db
+    if _db is None:
+        _db = load_index()
+    return _db
 
 
 def _get_reranker() -> CrossEncoder:
@@ -40,8 +48,7 @@ def _get_bm25(k: int) -> BM25Retriever:
     """Build (once) and return a BM25 retriever over the full CMS index."""
     global _bm25
     if _bm25 is None:
-        db = load_index()
-        result = db.get(include=["documents", "metadatas"])
+        result = _get_db().get(include=["documents", "metadatas"])
         docs = [
             Document(page_content=text, metadata=meta)
             for text, meta in zip(result["documents"], result["metadatas"])
@@ -54,7 +61,7 @@ def _get_bm25(k: int) -> BM25Retriever:
 
 def _hybrid_retrieve(query: str, k: int) -> list[Document]:
     """Fuse BM25 (sparse) + dense vector results via Reciprocal Rank Fusion."""
-    db = load_index()
+    db = _get_db()
     dense_docs = db.as_retriever(
         search_type="similarity_score_threshold",
         search_kwargs={"k": k, "score_threshold": PIPELINE_CONFIG["threshold"]},

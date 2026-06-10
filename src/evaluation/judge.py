@@ -234,6 +234,12 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
                 time.sleep(wait)
         dfs.append(res.to_pandas())
 
+    if not dfs:
+        logger.warning("No RAGAS samples to evaluate — all items had empty retrieval.")
+        scores = {"empty_retrieval_rate": 1.0, "citation_accuracy": 0.0, "policy_recall": 0.0, "ragas_n": 0}
+        with EVAL_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), "judge_model": JUDGE_MODEL, "prompt": PROMPT_TAG, **PIPELINE_CONFIG, **scores}) + "\n")
+        return scores
     df = pd.concat(dfs, ignore_index=True)
     # RAGAS metrics: averaged over non-empty-retrieval samples only
     skip = {"user_input", "retrieved_contexts", "response", "reference"}
