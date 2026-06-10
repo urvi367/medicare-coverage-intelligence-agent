@@ -25,6 +25,15 @@ _FEEDBACK_LABELS = {
 }
 
 
+def _truncate_to_sentence(text: str, max_chars: int = 400) -> str:
+    """Truncate text at the last sentence boundary within max_chars."""
+    if len(text) <= max_chars:
+        return text.strip()
+    window = text[:max_chars]
+    cut = max(window.rfind(". "), window.rfind(".\n"), window.rfind("? "), window.rfind("! "))
+    return (window[:cut + 1] if cut != -1 else window).strip()
+
+
 def _log_interaction(question: str, answer_text: str, sources: list) -> None:
     """Append one Q&A interaction to the JSONL log."""
     entry = {
@@ -140,7 +149,7 @@ if prompt := st.chat_input("Ask a Medicare coverage question..."):
                 "title": s.metadata.get("title", ""),
                 "policy_number": s.metadata.get("policy_number", ""),
                 "source": s.metadata.get("source", ""),
-                "excerpt": s.page_content[:400].strip(),
+                "excerpt": _truncate_to_sentence(s.page_content),
             }
             for s in result["sources"]
         ]
