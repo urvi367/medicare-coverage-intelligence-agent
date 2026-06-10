@@ -2,7 +2,6 @@
 
 import json
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Any
@@ -19,18 +18,13 @@ DATA_DIR = Path(__file__).parents[2] / "data"
 ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
-# 3 req/s without key; 10 req/s with NCBI_API_KEY
-_API_KEY = os.getenv("NCBI_API_KEY", "")
-_DELAY = 0.11 if _API_KEY else 0.34   # seconds between requests
+_DELAY = 0.34  # 3 req/s — NCBI unauthenticated rate limit
 
 _session = requests.Session()
 
 
 def _base_params() -> dict:
-    p = {"db": "pubmed", "retmode": "json"}
-    if _API_KEY:
-        p["api_key"] = _API_KEY
-    return p
+    return {"db": "pubmed", "retmode": "json"}
 
 
 def _search_pmids(query: str, max_results: int = 10) -> list[str]:

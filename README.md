@@ -207,4 +207,3 @@ Per-sample scores are written to `logs/eval_samples_latest.json` after each run.
 |---|---|---|
 | `GOOGLE_API_KEY` | Yes | Google AI API key — answer generation + RAGAS judge |
 | `GROQ_API_KEY` | Only for `generate_golden.py` | Groq API key for synthetic dataset generation |
-| `NCBI_API_KEY` | No | NCBI API key — raises PubMed rate limit from 3 to 10 req/s. Free at ncbi.nlm.nih.gov/account |
