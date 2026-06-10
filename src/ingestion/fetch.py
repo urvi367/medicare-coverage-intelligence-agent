@@ -23,9 +23,20 @@ _session = requests.Session()
 
 
 def _strip_html(text: str) -> str:
-    """Remove HTML tags and unescape entities from a string."""
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = html.unescape(text)
+    """Remove HTML tags and fully decode entities from a string.
+
+    CMS data is frequently double-escaped (e.g. '&amp;gt;' is the literal text for
+    '>'). A single html.unescape only peels one layer, leaving a stray '&gt;', so we
+    unescape repeatedly until stable before stripping the (now literal) tags.
+    """
+    for _ in range(5):                     # peel nested escaping: &amp;gt; → &gt; → >
+        decoded = html.unescape(text)
+        if decoded == text:
+            break
+        text = decoded
+    # Strip real HTML tags only — must start with a letter or '/'. This deliberately
+    # spares clinical comparisons like '< 80 mm Hg' / '> 130' that decoding exposed.
+    text = re.sub(r"</?[a-zA-Z][^>]*>", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
 

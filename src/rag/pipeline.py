@@ -18,8 +18,8 @@ from sentence_transformers import CrossEncoder
 from src.rag.indexer import load_index
 
 PIPELINE_CONFIG = {
-    "k": 5,
-    "threshold": 0.7,
+    "k": 10,
+    "threshold": 0.65,
     "reranker": "BAAI/bge-reranker-base",
     "reranker_top_n": 5,
 }
@@ -64,8 +64,12 @@ _LCD_ADDENDUM = (
 
 
 def _build_system(docs: list[Document]) -> str:
-    """Return a system prompt with the LCD note only when LCDs are present in docs."""
-    has_lcd = any(d.metadata.get("source", "") == "LCD" for d in docs)
+    """Return a system prompt with the LCD note only when the top-ranked doc is an LCD.
+
+    Stray LCD chunks ranked 2nd-5th (cosine overlap on a related topic) should not
+    trigger a jurisdiction warning on what is otherwise an NCD answer.
+    """
+    has_lcd = bool(docs) and docs[0].metadata.get("source", "") == "LCD"
     base = _BASE_SYSTEM
     if has_lcd:
         base += _LCD_ADDENDUM
@@ -111,7 +115,7 @@ def _retryable(exc: BaseException) -> bool:
 def answer(
     question: str,
     model: str = "gemini-2.5-flash",
-    k: int = 5,
+    k: int | None = None,
 ) -> dict[str, Any]:
     """Retrieve relevant policy chunks and return a cited answer via Gemini.
 
@@ -122,7 +126,7 @@ def answer(
     db = load_index()
     retriever = db.as_retriever(
         search_type="similarity_score_threshold",
-        search_kwargs={"k": k, "score_threshold": PIPELINE_CONFIG["threshold"]},
+        search_kwargs={"k": k or PIPELINE_CONFIG["k"], "score_threshold": PIPELINE_CONFIG["threshold"]},
     )
     llm = ChatGoogleGenerativeAI(model=model, temperature=0)
 
@@ -154,12 +158,12 @@ def answer(
             attempt += 1
 
 
-def build_chain(model: str = "gemini-2.5-flash", k: int = 5):
+def build_chain(model: str = "gemini-2.5-flash", k: int | None = None):
     """Return a streaming-compatible LangChain LCEL chain (answer text only)."""
     db = load_index()
     retriever = db.as_retriever(
         search_type="similarity_score_threshold",
-        search_kwargs={"k": k, "score_threshold": PIPELINE_CONFIG["threshold"]},
+        search_kwargs={"k": k or PIPELINE_CONFIG["k"], "score_threshold": PIPELINE_CONFIG["threshold"]},
     )
     llm = ChatGoogleGenerativeAI(model=model, temperature=0)
 

@@ -16,6 +16,10 @@
 | v1.3 | 2026-06-08 | Fix AnswerRelevancy NaN (BAAI embeddings + bypass_n=True); upgrade to paid API tier; add eval results history |
 | v1.4 | 2026-06-08 | Add cosine similarity threshold 0.7; per-sample scores to `logs/eval_samples_latest.json` |
 | v1.5 | 2026-06-09 | Add cross-encoder reranker (bge-reranker-base, top 3 of k=5); conditionalize LCD boilerplate (inject only when LCD retrieved); fix NCD-only eval bug (legacy LCD cache entries were contaminating scores); remove redundant `document_type` field from golden dataset |
+| v1.6 | 2026-06-09 | Fix `_strip_html` bug (HTML entities unescaped after tag-strip, leaving `<p>` noise in all chunks). Add title prepend + synonym expansion (50+ clinical↔CMS term pairs) to every chunk at index time. Context Precision target met (0.832). |
+| v1.7 | 2026-06-10 | Widen retrieval to k=10 / threshold=0.65 (reranker now selects 5-of-10, not just reorders). Dynamic answer cache path derived from PIPELINE_CONFIG — each config gets its own file, no stale reuse. Add JUDGE_MODEL + PROMPT_TAG constants to judge.py; upgrade judge to gemini-2.5-flash. Add policy_recall metric. |
+| v1.8 | 2026-06-10 | Fix root cause of persistent HTML entities: CMS data is double-escaped (`&amp;gt;` → `&gt;` after one pass). `_strip_html` now unescapes to fixed point. Fix tag regex to spare clinical comparisons (`< 80 mm Hg`). Fix `build_index` silently appending on rebuild (Chroma assigns fresh IDs — index was 8473 chunks / 4× duplication). Add `shutil.rmtree` wipe before rebuild. Fix LCD jurisdiction addendum firing on stray LCD chunks ranked 2nd–5th — now only fires when top-ranked doc is an LCD. First clean baseline established. |
+| v1.9 | 2026-06-10 | Phase 2 scaffold: `src/ingestion/fetch_pubmed.py` (NCBI E-utilities, per-NCD topic search, dedup by PMID) + `src/rag/pubmed_indexer.py` (separate `pubmed_evidence` Chroma collection, safe rebuild). |
 
 ---
 
@@ -28,11 +32,15 @@ NCD subset only (119/198 LCD entries excluded — Phase 1). Append a row after e
 | 2026-06-08 | 19 NCD | 5 | — | — | 0.867 | NaN | 0.717 | — | — | First run. AnswerRelevancy NaN — embeddings 404 + Gemini n=1 bug. Fixed in v1.3. |
 | 2026-06-08 23:02 | 79 NCD | 5 | 0.70 | — | **0.923** ✅ | 0.802 | 0.784 | 0.0% | 0.135† | True NCD-only baseline. Faithfulness target met. |
 | 2026-06-09 03:51 | 79 NCD | 3 | 0.75 | — | 0.792 | 0.660 | 0.646 | 26.6% | 0.709 | Aggressive filtering backfired — empty retrieval too high. Reverted. |
-| 2026-06-09 05:10 | 79 NCD | 5 | 0.70 | 3 | 0.791 | 0.762 | **0.789** | 10.1% | 0.835 | Reranker top_n=3 hurt faithfulness (-0.13). Changing to top_n=5 (reorder only). |
+| 2026-06-09 05:10 | 79 NCD | 5 | 0.70 | 3 | 0.791 | 0.762 | 0.789 | 10.1% | 0.835 | Reranker top_n=3 hurt faithfulness (-0.13). Changing to top_n=5 (reorder only). |
+| 2026-06-09 19:02 | 79 NCD | 5 | 0.70 | 5 | 0.860 | 0.761 | **0.832** ✅ | 7.6% | 0.899 | HTML strip fix + title prepend + synonym expansion. Context Precision target met. Faithfulness still below no-reranker baseline — reranker remains suspect. |
+| 2026-06-09 23:42 | 79 NCD | 10 | 0.65 | 5 | 0.782 | 0.827 | 0.921 | 0.0% | 0.949 | ⚠️ CONTAMINATED — index had 8473 chunks (4× duplicates from append-on-rebuild). Judge upgraded to flash. Numbers not comparable to prior rows. |
+| 2026-06-10 00:57 | 78 NCD‡ | 10 | 0.65 | 5 | 0.821 | **0.857** ✅ | **0.892** ✅ | 1.3% | 0.886 | **First clean baseline** — deduplicated index (1983 chunks), double-escape entity fix, LCD addendum top-doc fix. Answer Relevancy target met. |
 
 † Citation accuracy 0.135 is a measurement artifact — old cache entries lack `source_policy_numbers`; regex fallback understates true rate.
+‡ 1 additional empty retrieval vs prior runs (78 RAGAS samples instead of 79).
 
-**Targets:** Faithfulness > 0.90 ✅ · Answer Relevancy > 0.85 · Context Precision > 0.80 · Empty Retrieval < 15% ✅ · Citation Acc. > 95%
+**Targets:** Faithfulness > 0.90 · Answer Relevancy > 0.85 ✅ · Context Precision > 0.80 ✅ · Empty Retrieval < 15% ✅ · Citation Acc. > 95% · Policy Recall > 90% ✅
 
 ---
 
@@ -72,11 +80,11 @@ Phase 1 uses RAG + prompt engineering — no agent loop. Coverage policy lookup 
 |---|---|---|
 | 1. Input validation | Rule-based filter | Block PHI. Flag member-specific queries. |
 | 2. Query embedding | `BAAI/bge-small-en-v1.5` (local CPU) | Same model used at index and query time. Zero API cost. |
-| 3. Vector search | ChromaDB at `data/chroma/` | k=5, cosine similarity threshold=0.7. 800-char chunks / 100-char overlap. |
-| 4. Cross-encoder reranking | `BAAI/bge-reranker-base` (local CPU) | Scores each (query, chunk) pair jointly. Keeps top 3 of k=5. More accurate than cosine alone. |
-| 5. Context injection | Prompt template | Top-3 reranked chunks with NCD/LCD headers. LCD jurisdiction note injected only when an LCD is present in retrieved docs. |
+| 3. Vector search | ChromaDB at `data/chroma/` | k=10, cosine similarity threshold=0.65. 800-char chunks / 100-char overlap. |
+| 4. Cross-encoder reranking | `BAAI/bge-reranker-base` (local CPU) | Scores each (query, chunk) pair jointly. Selects top 5 of k=10 — real filtering, not just reordering. |
+| 5. Context injection | Prompt template | Top-5 reranked chunks with NCD/LCD headers. LCD jurisdiction note injected only when the top-ranked doc is an LCD. |
 | 6. Answer generation | `gemini-2.5-flash` — temperature=0 | Indefinite retry loop reads `retryDelay` from API error. Returns answer + source Documents. |
-| 7. RAGAS evaluation | `gemini-2.5-flash-lite` + `BAAI/bge-small-en-v1.5` | Faithfulness, AnswerRelevancy (bypass_n=True), LLMContextPrecisionWithoutReference. Per-sample scores → `logs/eval_samples_latest.json`. Persistent answer cache — NCD questions reused across runs. |
+| 7. RAGAS evaluation | `gemini-2.5-flash` + `BAAI/bge-small-en-v1.5` | Faithfulness, AnswerRelevancy (bypass_n=True), LLMContextPrecisionWithoutReference, policy_recall, citation_accuracy. Per-sample scores → `logs/eval_samples_latest.json`. Cache path derived from PIPELINE_CONFIG — each config gets its own file. |
 | 8. Response delivery | Streamlit | Chat interface with source expander. All interactions logged to `logs/interactions.jsonl`. |
 
 > **LCD jurisdiction — current state:** Geographic awareness is a prompt instruction only — LCD responses include a jurisdiction warning when an LCD is retrieved. Full implementation (MAC region UI, jurisdiction filtering, LCD eval) is deferred to Phase 2.
@@ -87,11 +95,12 @@ Phase 1 uses RAG + prompt engineering — no agent loop. Coverage policy lookup 
 
 | Metric | How measured | Target | Current |
 |---|---|---|---|
-| Faithfulness | RAGAS Faithfulness | > 90% | **0.923 ✅** |
-| Answer Relevancy | RAGAS AnswerRelevancy | > 85% | 0.802 |
-| Context Precision | RAGAS LLMContextPrecisionWithoutReference | > 80% | 0.784 |
-| Citation accuracy | Policy numbers from retrieved docs appear in response | > 95% | 0.835 (improving — see eval notes†) |
-| Empty retrieval rate | % queries returning no chunks | < 15% | **0.0% ✅** |
+| Faithfulness | RAGAS Faithfulness | > 90% | 0.821 |
+| Answer Relevancy | RAGAS AnswerRelevancy | > 85% | **0.857 ✅** |
+| Context Precision | RAGAS LLMContextPrecisionWithoutReference | > 80% | **0.892 ✅** |
+| Citation accuracy | Policy numbers from retrieved docs appear in response | > 95% | 0.886 |
+| Empty retrieval rate | % queries returning no chunks | < 15% | **1.3% ✅** |
+| Policy recall | Expected NCD policy number present in retrieved chunks | > 90% | **0.962 ✅** |
 | False coverage rate | % responses incorrectly stating "covered" — manually audited | **0% — critical** | Pending audit |
 | Response time p95 | End-to-end latency | < 8s | — |
 | Cost per query | Embedding + reranking + generation + judge | < $0.06 | ~$0.004 |
@@ -152,7 +161,7 @@ Phase 1 uses RAG + prompt engineering — no agent loop. Coverage policy lookup 
 | Wrong NCD/LCD retrieved | Display full title + ID before synthesis. Reviewer verifies source. |
 | Outdated policy cited | Weekly diff-check. Surface policy version date prominently. |
 | Conditional coverage missed ("covered if A and B" → "covered") | Structured output with explicit conditional criteria field. Judge evaluates condition preservation. |
-| Vocabulary gap (clinical term ≠ CMS term) | Index CMS MLN articles as vocabulary bridge (Month 2). |
+| Vocabulary gap (clinical term ≠ CMS term) | Title prepended to every chunk at index time (v1.6). MLN article ingestion as deeper vocabulary bridge (Month 2). |
 | Geographic variation missed | LCD jurisdiction prompt note (v1.2). Full MAC region UI enforcement → Phase 2. |
 | PHI in query | Input validation blocks PHI before any LLM call or storage. |
 | Prompt injection via policy document | Document sanitisation at ingestion. Output validation before delivery. |

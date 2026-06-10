@@ -20,9 +20,19 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 GOLDEN_PATH = Path(__file__).parents[2] / "data" / "golden_dataset.json"
-ANSWERS_CACHE_PATH = Path(__file__).parents[2] / "logs" / "rag_answers_cache_k5_threshold0.7_reranked.json"
 EVAL_LOG_PATH = Path(__file__).parents[2] / "logs" / "eval_results.jsonl"
 EVAL_SAMPLES_PATH = Path(__file__).parents[2] / "logs" / "eval_samples_latest.json"
+
+JUDGE_MODEL = "gemini-2.5-flash"
+PROMPT_TAG = "v1"
+
+
+def _answers_cache_path() -> Path:
+    """Derive cache path from current PIPELINE_CONFIG so each config gets its own file."""
+    from src.rag.pipeline import PIPELINE_CONFIG
+    cfg = PIPELINE_CONFIG
+    name = f"rag_answers_cache_k{cfg['k']}_threshold{cfg['threshold']}_n{cfg['reranker_top_n']}.json"
+    return Path(__file__).parents[2] / "logs" / name
 
 
 def load_golden_dataset() -> list[dict[str, str]]:
@@ -79,9 +89,10 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
         )
 
     # --- persistent answer cache: skip questions already answered in any prior run ---
-    if ANSWERS_CACHE_PATH.exists():
-        cached: list[dict] = json.loads(ANSWERS_CACHE_PATH.read_text(encoding="utf-8"))
-        logger.info("Loaded answer cache: %d questions already answered", len(cached))
+    answers_cache_path = _answers_cache_path()
+    if answers_cache_path.exists():
+        cached: list[dict] = json.loads(answers_cache_path.read_text(encoding="utf-8"))
+        logger.info("Loaded answer cache (%s): %d questions already answered", answers_cache_path.name, len(cached))
     else:
         cached = []
 
@@ -111,7 +122,7 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
             ],
             "reference": item["reference_answer"],
         })
-        ANSWERS_CACHE_PATH.write_text(json.dumps(cached, indent=2), encoding="utf-8")
+        answers_cache_path.write_text(json.dumps(cached, indent=2), encoding="utf-8")
 
     def _extract_policy_numbers(text: str) -> set[str]:
         lcd = set(re.findall(r'\bL\d{4,6}\b', text))
@@ -130,18 +141,40 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
 
     # restrict evaluation to NCD golden questions only — exclude legacy LCD cache entries
     ncd_questions = {item["question"] for item in golden}
+    # map question → expected policy_number for policy_recall metric
+    golden_policy = {item["question"]: item.get("policy_number", "") for item in golden}
     eval_cache = [item for item in cached if item["user_input"] in ncd_questions]
     logger.info("Evaluating %d/%d cached entries (NCD golden set only)", len(eval_cache), len(cached))
 
+    # extra metrics computed over ALL eval_cache (including empty-retrieval items)
     extra_rows = []
     for item in eval_cache:
+        expected_pn = golden_policy.get(item["user_input"], "")
+        source_pns = item.get("source_policy_numbers", [])
+        if not expected_pn:
+            policy_recall = None          # no expected policy in golden → skip
+        elif not source_pns:
+            policy_recall = 0.0           # empty retrieval → wrong NCD
+        else:
+            policy_recall = 1.0 if expected_pn in source_pns else 0.0
         extra_rows.append({
             "user_input": item["user_input"],
-            "empty_retrieval": 1.0 if not item["retrieved_contexts"] else 0.0,
+            "empty_retrieval_rate": 1.0 if not item["retrieved_contexts"] else 0.0,
             "citation_accuracy": _citation_accuracy(item),
+            "policy_recall": policy_recall,
         })
 
-    # only the 4 RAGAS-required fields go into SingleTurnSample
+    # RAGAS runs only on items that actually retrieved documents.
+    # Empty-retrieval responses ("I cannot answer") are retrieval failures, not
+    # faithfulness failures — including them drags down faithfulness/AR unfairly.
+    ragas_items = [item for item in eval_cache if item["retrieved_contexts"]]
+    skipped_empty = len(eval_cache) - len(ragas_items)
+    if skipped_empty:
+        logger.info(
+            "Excluding %d empty-retrieval items from RAGAS (counted in empty_retrieval_rate)",
+            skipped_empty,
+        )
+
     samples = [
         SingleTurnSample(
             user_input=item["user_input"],
@@ -149,13 +182,13 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
             retrieved_contexts=item["retrieved_contexts"],
             reference=item["reference"],
         )
-        for item in eval_cache
+        for item in ragas_items
     ]
 
     # bypass_n=True: Gemini ignores n>1 and returns 1 generation; this makes RAGAS
     # send n separate single requests instead of one n=3 request.
     llm = LangchainLLMWrapper(
-        ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0),
+        ChatGoogleGenerativeAI(model=JUDGE_MODEL, temperature=0),
         bypass_n=True,
     )
     # Use the same local model as the vector index — no API quota, no availability issues.
@@ -169,7 +202,7 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
         LLMContextPrecisionWithoutReference(llm=llm),
     ]
 
-    # gemini-2.5-flash-lite paid tier: 1000+ RPM → 1s between samples is ample headroom
+    # gemini-2.5-flash paid tier: 1000+ RPM → 1s between samples is ample headroom
     _JUDGE_DELAY = 1.0
 
     def _judge_retry_delay(exc: BaseException) -> float | None:
@@ -202,10 +235,19 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
         dfs.append(res.to_pandas())
 
     df = pd.concat(dfs, ignore_index=True)
-    df = df.merge(pd.DataFrame(extra_rows), on="user_input", how="left")
+    # RAGAS metrics: averaged over non-empty-retrieval samples only
     skip = {"user_input", "retrieved_contexts", "response", "reference"}
     scores = {col: round(float(df[col].mean(skipna=True)), 3) for col in df.columns if col not in skip}
-    logger.info("Evaluation scores: %s", scores)
+    # extra metrics: averaged over ALL eval_cache items (empty retrieval included)
+    extra_df = pd.DataFrame(extra_rows)
+    scores["empty_retrieval_rate"] = round(float(extra_df["empty_retrieval_rate"].mean()), 3)
+    scores["citation_accuracy"] = round(float(extra_df["citation_accuracy"].mean(skipna=True)), 3)
+    scores["policy_recall"] = round(float(extra_df["policy_recall"].mean(skipna=True)), 3)
+    scores["ragas_n"] = len(ragas_items)
+    logger.info("Evaluation scores (RAGAS on %d/%d samples): %s", len(ragas_items), len(eval_cache), scores)
+
+    # merge extra_rows into df for per-sample export (left join keeps only ragas rows)
+    df = df.merge(extra_df, on="user_input", how="left")
 
     EVAL_LOG_PATH.parent.mkdir(exist_ok=True)
 
@@ -217,7 +259,7 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
     )
 
     with EVAL_LOG_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), **PIPELINE_CONFIG, **scores}) + "\n")
+        f.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), "judge_model": JUDGE_MODEL, "prompt": PROMPT_TAG, **PIPELINE_CONFIG, **scores}) + "\n")
 
     return scores
 
