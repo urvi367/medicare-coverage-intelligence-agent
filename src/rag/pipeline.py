@@ -16,7 +16,6 @@ from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from sentence_transformers import CrossEncoder
 
 from src.rag.indexer import load_index
-from src.rag.pubmed_indexer import load_pubmed_index
 
 PIPELINE_CONFIG = {
     "k": 10,
@@ -155,110 +154,6 @@ def answer(
                 "Gemini rate limited — waiting %.0fs before retry #%d",
                 wait, attempt + 1,
             )
-            time.sleep(wait)
-            attempt += 1
-
-
-_GAP_SYSTEM = (
-    "You are a Medicare coverage policy expert comparing CMS policy to published clinical evidence.\n\n"
-    "You have two sets of documents:\n"
-    "  1. CMS POLICY — NCDs/LCDs stating Medicare's official coverage position\n"
-    "  2. PUBMED EVIDENCE — peer-reviewed abstracts on clinical outcomes\n\n"
-    "Structure your response exactly as follows:\n\n"
-    "CMS Coverage Position: [Covered | Not Covered | Covered with Conditions | Not Addressed]\n"
-    "  - [NCD/LCD number]: [criteria exactly as written]\n\n"
-    "Clinical Evidence:\n"
-    "  - [PMID year, journal]: [key finding and study type — 1 sentence]\n"
-    "  (one bullet per abstract; write 'No relevant abstracts retrieved' if none)\n\n"
-    "Evidence Grade: [Strong — RCT or meta-analysis | Moderate — cohort or observational | Weak / Insufficient]\n\n"
-    "Alignment: [Aligned | Partially Aligned | Conflicting | "
-    "Coverage Gap — evidence supports but CMS does not cover | "
-    "Inverse Gap — CMS covers but clinical evidence is weak]\n\n"
-    "Gap Summary: [2–3 sentences: where CMS policy and evidence agree or diverge, "
-    "and the practical implication for coverage decisions.]\n\n"
-    "CMS Policy Documents:\n{policy_context}\n\n"
-    "PubMed Abstracts:\n{pubmed_context}"
-)
-
-
-def _format_pubmed_docs(docs: list[Document]) -> str:
-    """Format PubMed abstracts into a numbered context block."""
-    if not docs:
-        return "No PubMed abstracts retrieved."
-    parts = []
-    for i, d in enumerate(docs, 1):
-        m = d.metadata
-        header = f"[{i}] PMID {m.get('pmid', '?')} ({m.get('year', '?')}) — {m.get('journal', '?')}"
-        parts.append(f"{header}\n{d.page_content}")
-    return "\n\n---\n\n".join(parts)
-
-
-def gap_analysis(
-    question: str,
-    model: str = "gemini-2.5-flash",
-    k: int | None = None,
-) -> dict[str, Any]:
-    """Retrieve CMS policy + PubMed evidence and return a structured gap report.
-
-    Returns a dict with keys:
-        gap_report     — structured gap analysis string
-        policy_sources — CMS NCD/LCD Documents used
-        pubmed_sources — PubMed abstract Documents used
-    """
-    k_ = k or PIPELINE_CONFIG["k"]
-    threshold = PIPELINE_CONFIG["threshold"]
-
-    policy_db = load_index()
-    policy_docs: list[Document] = _rerank(
-        question,
-        policy_db.as_retriever(
-            search_type="similarity_score_threshold",
-            search_kwargs={"k": k_, "score_threshold": threshold},
-        ).invoke(question),
-        top_n=PIPELINE_CONFIG["reranker_top_n"],
-    )
-
-    try:
-        pubmed_db = load_pubmed_index()
-        pubmed_docs: list[Document] = _rerank(
-            question,
-            pubmed_db.as_retriever(
-                search_type="similarity_score_threshold",
-                search_kwargs={"k": k_, "score_threshold": threshold},
-            ).invoke(question),
-            top_n=PIPELINE_CONFIG["reranker_top_n"],
-        )
-    except RuntimeError:
-        logger.warning("PubMed index not found — run fetch_pubmed + pubmed_indexer first")
-        pubmed_docs = []
-
-    policy_context = _format_docs(policy_docs) if policy_docs else "No CMS policy documents retrieved."
-    pubmed_context = _format_pubmed_docs(pubmed_docs)
-
-    prompt_value = ChatPromptTemplate.from_messages(
-        [("system", _GAP_SYSTEM), ("human", "{question}")]
-    ).format_messages(
-        policy_context=policy_context,
-        pubmed_context=pubmed_context,
-        question=question,
-    )
-
-    llm = ChatGoogleGenerativeAI(model=model, temperature=0)
-    attempt = 0
-    while True:
-        try:
-            response = llm.invoke(prompt_value)
-            return {
-                "gap_report": response.content,
-                "policy_sources": policy_docs,
-                "pubmed_sources": pubmed_docs,
-            }
-        except Exception as exc:
-            if not _retryable(exc):
-                raise
-            suggested = _parse_retry_delay(exc)
-            wait = (suggested + random.uniform(1, 3)) if suggested else min(2 ** min(attempt, 5) * 5 + random.uniform(0, 2), 120)
-            logger.warning("Gemini rate limited — waiting %.0fs before retry #%d", wait, attempt + 1)
             time.sleep(wait)
             attempt += 1
 
