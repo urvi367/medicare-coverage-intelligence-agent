@@ -1,13 +1,11 @@
-langchain
-langchain-groq
-langchain-google-genai
-langchain-community
-langchain-chroma
-langchain-text-splitters
-chromadb
-sentence-transformers
-streamlit
-requests
-python-dotenv
-ragas>=0.2
-datasets
+langchain==1.3.4
+langchain-google-genai==4.2.4
+langchain-community==0.4.2
+langchain-chroma==1.1.0
+langchain-text-splitters==1.1.2
+chromadb==1.5.9
+sentence-transformers==5.5.1
+streamlit==1.58.0
+requests==2.34.2
+python-dotenv==1.2.2
+-e .
