@@ -1,10 +1,12 @@
 """Evaluate gap_analysis() against the golden gap dataset.
 
 Metrics:
-  alignment_accuracy — exact match on the Alignment label (Aligned / Gap / Conflicting …)
-  ncd_recall         — expected NCD policy number cited in the gap report
+  alignment_accuracy — canonical-label match vs the independent reference alignment
+  ncd_recall         — expected NCD surfaced by RETRIEVAL (in policy_sources metadata),
+                       not merely echoed in the report — tests retrieval, not parroting
   pmid_recall        — fraction of reference PMIDs cited (when reference_pmids available)
-  faithfulness       — RAGAS faithfulness of gap report vs policy_sources
+  citation_precision — fraction of cited PMIDs that were actually retrieved
+  faithfulness       — RAGAS faithfulness of gap report vs policy + pubmed contexts
 """
 
 import json
@@ -50,11 +52,6 @@ def _parse_alignment(text: str) -> str:
     """Extract the Alignment: label from a structured gap report."""
     m = re.search(r"Alignment:\s*\**(.+?)\**(?:\n|$)", text)
     return m.group(1).strip() if m else ""
-
-
-def _parse_ncd_numbers(text: str) -> set[str]:
-    # 1–3 digit prefix so single-digit NCD sections (e.g. 1.2) match alongside 100.x.
-    return set(re.findall(r"\b\d{1,3}\.\d{1,2}(?:\.\d{1,2})*\b", text))
 
 
 def _parse_pmids(text: str) -> set[str]:
@@ -114,6 +111,9 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
             "reference_pmids": item.get("reference_pmids", []),
             "gap_report": result["gap_report"],
             "policy_contexts": [d.page_content for d in result["policy_sources"]],
+            "policy_ncds": [
+                d.metadata.get("policy_number", "") for d in result["policy_sources"] if d.metadata.get("policy_number")
+            ],
             "pubmed_contexts": [d.page_content for d in result["pubmed_sources"]],
             "pubmed_pmids": [
                 d.metadata.get("pmid", "") for d in result["pubmed_sources"] if d.metadata.get("pmid")
@@ -131,7 +131,6 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
         # compare would spuriously fail. canonical_alignment collapses both.
         actual_alignment = canonical_alignment(_parse_alignment(report))
         reference_alignment = canonical_alignment(item.get("reference_alignment", ""))
-        ncds_cited = _parse_ncd_numbers(report)
         pmids_cited = _parse_pmids(report)
         ref_pmids = set(item.get("reference_pmids", []))
 
@@ -143,7 +142,11 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
             and actual_alignment == reference_alignment
             else 0.0
         )
-        ncd_recall = 1.0 if item["expected_ncd"] and item["expected_ncd"] in ncds_cited else 0.0
+        # Retrieval-level: did the expected NCD actually get surfaced into policy_sources?
+        # (vs. the old check that just parsed the number out of the generated report,
+        # which was ~1.0 always since the NCD is handed to the model and it's told to cite it.)
+        retrieved_ncds = set(item.get("policy_ncds", []))
+        ncd_recall = 1.0 if item["expected_ncd"] and item["expected_ncd"] in retrieved_ncds else 0.0
         pmid_recall = (
             len(pmids_cited & ref_pmids) / len(ref_pmids) if ref_pmids else None
         )
