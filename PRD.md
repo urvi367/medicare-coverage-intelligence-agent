@@ -21,10 +21,12 @@
 | v1.8 | 2026-06-10 | Fix root cause of persistent HTML entities: CMS data is double-escaped (`&amp;gt;` → `&gt;` after one pass). `_strip_html` now unescapes to fixed point. Fix tag regex to spare clinical comparisons (`< 80 mm Hg`). Fix `build_index` silently appending on rebuild (Chroma assigns fresh IDs — index was 8473 chunks / 4× duplication). Add `shutil.rmtree` wipe before rebuild. Fix LCD jurisdiction addendum firing on stray LCD chunks ranked 2nd–5th — now only fires when top-ranked doc is an LCD. First clean baseline established. |
 | v1.9 | 2026-06-10 | Phase 2 scaffold: `src/ingestion/fetch_pubmed.py` (NCBI E-utilities, per-NCD topic search, dedup by PMID) + `src/rag/pubmed_indexer.py` (separate `pubmed_evidence` Chroma collection, safe rebuild). Moved to `phase-2` branch. |
 | v2.0 | 2026-06-10 | Hybrid BM25 + dense retrieval with Reciprocal Rank Fusion (RRF k=60). BM25 fixes numeric threshold retrieval failures (e.g. "55 mmHg"). `search_mode` field added to PIPELINE_CONFIG; cache path now includes mode suffix. Chroma DB object cached in `_get_db()` — no longer reopened per query. Blank chunk filter added to `build_index()`. UI: feedback buttons (positive/partial/negative), full chunk text in sources expander. Deployed to Streamlit Community Cloud (`main` branch). |
+| v2.1 | 2026-06-11 | **Phase 2 gap analysis implemented** (`phase-2` branch). `gap_analysis()` in pipeline.py: NCD-only hybrid retrieval + rerank (policy side) joined to PubMed evidence via **topical join** (abstracts filtered by `source_ncd_number == policy_number`, so evidence and policy describe the same intervention; empty join → "Insufficient Evidence" rather than unrelated abstracts). PubMed side: dense top-`pubmed_k`(8), no cross-encoder (bge-reranker not trained on clinical text), sorted newest-first. UI auto-routes policy vs gap queries via regex signal scoring (no mode toggle). Fixed PubMed date parser (ElementTree childless-element falsy bug left 99% of years blank); re-fetched → 2457 abstracts, 0% empty years. Gap eval: `generate_golden_gap.py` (independent `gemini-2.5-flash-lite` labeler reads raw NCD + abstracts — breaks circular self-grading; Groq question cache + rate-limit backoff) and `judge_gap.py` (retrieval-gated `alignment_accuracy`, `alignment_label_match`, `ncd_recall`, `pmid_recall`, `citation_precision`, faithfulness over policy+pubmed). Interaction/feedback logging extended with `mode`, `alignment`, and PubMed sources. |
 
 ---
 
-## Evaluation Results History
+<details>
+<summary><strong>Evaluation Results History</strong> — Phase 1 RAGAS runs (click to expand)</summary>
 
 NCD subset only (119/198 LCD entries excluded — Phase 1). Append a row after each `python -m src.evaluation.judge` run.
 
@@ -44,11 +46,12 @@ NCD subset only (119/198 LCD entries excluded — Phase 1). Append a row after e
 
 **Targets:** Faithfulness > 0.90 · Answer Relevancy > 0.85 ✅ · Context Precision > 0.80 ✅ · Empty Retrieval < 15% ✅ · Citation Acc. > 95% · Policy Recall > 90% ✅
 
----
+</details>
 
 ---
 
-# PHASE 1 — Coverage Policy Intelligence Agent
+<details>
+<summary><h1>PHASE 1 — Coverage Policy Intelligence Agent</h1></summary>
 
 ---
 
@@ -207,11 +210,12 @@ Phase 1 uses RAG + prompt engineering — no agent loop. Coverage policy lookup 
 | Month 2 | Expert review of 20 golden pairs/month. Vocab bridge (MLN articles). Answer Relevancy > 85%. |
 | Month 3 | Golden dataset → 500 pairs. Citation link-checking. False coverage rate audit. |
 
----
+</details>
 
 ---
 
-# PHASE 2 — Evidence vs Coverage Gap Analyzer
+<details open>
+<summary><h1>PHASE 2 — Evidence vs Coverage Gap Analyzer</h1></summary>
 
 ---
 
@@ -224,48 +228,73 @@ Medical policy teams currently pay $200K–500K per engagement for periodic manu
 
 ---
 
-## 13. Phase 2 Architecture
+## 13. Phase 2 Architecture — Evidence Gap Analysis (implemented)
 
-**Multi-source agentic pipeline:**
-1. RAG retrieval from CMS NCD/LCD corpus (Phase 1 pipeline, unchanged)
-2. PubMed/MEDLINE search for clinical evidence on the same service/indication
-3. Synthesis agent: compare coverage criteria vs evidence strength → identify gaps, conflicts, alignment
-4. Structured gap report: coverage position · evidence grade · gap type · recommended action
+`gap_analysis()` in `src/rag/pipeline.py`. Both retrieval legs are local (embeddings + reranker on CPU); only generation calls an API.
 
-**Full LCD jurisdiction implementation (deferred from Phase 1):**
-- MAC region metadata surfaced in UI — visually prominent, not dismissible
-- Reviewer jurisdiction profile — LCDs from other jurisdictions auto-flagged
-- LCD entries re-admitted to eval with jurisdiction-aware scoring
-- Retrieval filtering by reviewer's MAC region
+| Step | Component | Details |
+|---|---|---|
+| 1. Routing | `_route()` in `app.py` | Regex signal scoring routes each query to Policy Q&A or Gap Analysis — no manual mode toggle. Evidence words ("evidence", "studies", "RCT") vs policy words ("covered", "criteria", "NCD"). |
+| 2. Policy retrieval | `_hybrid_retrieve_ncd` + rerank | **NCD-only** hybrid BM25+dense (LCDs excluded from gap analysis), RRF-fused, cross-encoder reranked to top 5. |
+| 3. Topical join | `_pubmed_for_ncds` | PubMed abstracts pulled **only for the NCD(s) surfaced on the policy side** (`source_ncd_number == policy_number`), so evidence and coverage position describe the same intervention. Dense top-`pubmed_k`(8), no threshold (the NCD filter is the topicality gate), no cross-encoder (bge-reranker-base is not trained on clinical abstracts), sorted newest-first. **Empty join → "Insufficient Evidence"** rather than unrelated abstracts from an open search. |
+| 4. Gap synthesis | `gemini-2.5-flash` — temperature=0 | Structured report: **CMS Coverage Position · Clinical Evidence (one `PMID <id>` bullet per abstract) · Evidence Grade · Alignment · Gap Summary**. Prompt forbids citing PMIDs not in the provided abstracts; pins Evidence Grade/Alignment to "Insufficient" when no abstracts are retrieved. |
+| 5. Delivery | Streamlit | Separate "CMS Policy Sources" and "PubMed Evidence" expanders (PMID · year · journal · excerpt). Interactions logged with `mode`, parsed `alignment`, and both source sets. |
+
+**Alignment taxonomy:** Aligned · Partially Aligned · Conflicting · Coverage Gap (evidence supports, CMS doesn't cover) · Inverse Gap (CMS covers, evidence weak) · Insufficient Evidence.
+
+**Full LCD jurisdiction implementation (still deferred):** MAC region UI, reviewer jurisdiction profile, LCD re-admission to eval, MAC-region retrieval filtering — not yet built.
 
 ---
 
 ## 14. Phase 2 Data Sources
 
-| Source | Coverage | Access |
+| Source | Coverage | Access | Status |
+|---|---|---|---|
+| CMS NCDs/LCDs | 1,983 chunks (`cms_coverage`) | CMS Coverage API | Indexed |
+| PubMed/MEDLINE | **2,457 abstracts** (`pubmed_evidence`) across 294 NCD topics, ≤10 per topic, deduped by PMID | NCBI E-utilities (free, 3 req/s) | **Ingested** — `fetch_pubmed.py` searches per NCD title, parses PMID/title/abstract/year/journal, tags each with `source_ncd_number` for the topical join |
+| ClinicalTrials.gov | ~500K trials | ClinicalTrials API v2 | Planned |
+
+> **PubMed date parsing:** the original parser hit the ElementTree gotcha where a childless `<Year>` element is falsy, so `find(Year) or find(MedlineDate)` skipped real years — 99% of abstracts had blank years. Fixed with explicit `None` checks + a MedlineDate year-regex fallback; re-fetch yields 0% empty years (enables newest-first evidence ordering).
+
+---
+
+## 15. Phase 2 Evaluation, Metrics & Roadmap
+
+### 15.1 Gap evaluation framework
+
+Breaking the circularity: an early version graded the pipeline against labels produced by *running the pipeline itself* — measuring reproducibility, not correctness. The reference labels are now produced by an **independent judge**.
+
+- **`generate_golden_gap.py`** — for each NCD with abstracts: (1) Groq `llama-3.1-8b-instant` writes one evidence-seeking question (cached in `data/gap_questions.json`, rate-limit backoff); (2) an **independent `gemini-2.5-flash-lite` labeler** reads the *raw* NCD text + that NCD's abstracts (never the pipeline's report) and emits `reference_alignment`, `reference_pmids`, rationale → `data/golden_gap.json`. Different model tier + different prompt + raw evidence = labels independent of the pipeline's generation.
+- **`judge_gap.py`** — runs `gap_analysis()` per question (answers cached by config) and scores it against the independent reference.
+
+### 15.2 Metrics
+
+| Metric | Measures | Target |
 |---|---|---|
-| CMS NCDs/LCDs | ~2,400+ documents | CMS Coverage API (already indexed) |
-| PubMed/MEDLINE | 35M+ abstracts | NCBI E-utilities (free, rate-limited) |
-| ClinicalTrials.gov | ~500K trials | ClinicalTrials API v2 (free) |
+| `alignment_accuracy` | **End-to-end:** reached the reference alignment **AND** retrieved the right NCD (a correct label on the wrong retrieved policy = miss) | > 75% |
+| `alignment_label_match` | Diagnostic: raw label agreement vs reference, retrieval-blind — isolates reasoning from retrieval | — |
+| `ncd_recall` | Expected NCD surfaced into `policy_sources` by retrieval (not parroted from context) | > 90% |
+| `pmid_recall` | Fraction of the reference's key PMIDs the report cited | > 60% |
+| `citation_precision` | Fraction of cited PMIDs that were actually retrieved (catches fabricated citations) | > 95% |
+| `faithfulness` | RAGAS faithfulness of the gap report vs policy + PubMed contexts | > 90% |
+
+`alignment_accuracy = label_match ∧ ncd_recall`, so the three decompose failures: high `label_match` + low `ncd_recall` ⇒ retrieval is the bottleneck; the reverse ⇒ reasoning is.
+
+**Known limitations:** reference is a single unvalidated flash-lite label (recommend hand-validating ~20 before quoting scores); exact-match over 6 adjacent classes reads pessimistically; `label_match`/`pmid_recall` are retrieval-bounded by the evidence the pipeline saw; labeler/pipeline/judge are all Gemini (partial, not cross-vendor, independence).
+
+### 15.3 Roadmap
+
+| Milestone | Status |
+|---|---|
+| PubMed ingestion + indexing | ✅ Done (2,457 abstracts) |
+| Topical-join retrieval + gap synthesis | ✅ Done |
+| Independent gap eval (golden set + judge) | ✅ Done — pending first full run + human validation |
+| Full LCD jurisdiction implementation | Planned |
+| Expert validation (20 gap reports/month) | Planned |
+| Fine-tuning on gap assessments | Planned |
+
+</details>
 
 ---
 
-## 15. Phase 2 Metrics & Roadmap
-
-| Metric | Target |
-|---|---|
-| Gap identification accuracy (analyst-confirmed) | > 80% |
-| False positive gap rate | < 20% |
-| Evidence grade accuracy (RCT / meta-analysis / observational) | > 90% |
-
-| Milestone | Target |
-|---|---|
-| PubMed ingestion + indexing | Month 4 |
-| Multi-source retrieval + gap synthesis agent | Month 5 |
-| Full LCD jurisdiction implementation | Month 5 |
-| Expert validation (20 gap reports/month) | Month 6+ |
-| Fine-tuning on gap assessments | Month 7+ |
-
----
-
-*Medicare Coverage Intelligence Platform · PRD v2.0 · All data sources public · Last updated 2026-06-10*
+*Medicare Coverage Intelligence Platform · PRD v2.1 · All data sources public · Last updated 2026-06-11*

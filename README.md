@@ -104,30 +104,77 @@ Evaluated on 79 NCD questions (LCD entries excluded — Phase 1). Config: k=10, 
 
 ---
 
+## Evidence Gap Analysis (Phase 2 — branch: `phase-2`)
+
+Beyond "what does CMS cover?", the agent answers "where is CMS coverage out of step with published evidence?" The UI auto-routes each question to Policy Q&A or Gap Analysis by regex signal scoring — no manual toggle.
+
+<details>
+<summary><strong>How gap analysis works</strong></summary>
+
+- **Policy side:** NCD-only hybrid retrieval + cross-encoder rerank (top 5).
+- **Topical join:** PubMed abstracts are pulled *only for the NCD(s) retrieved on the policy side* (`source_ncd_number == policy_number`), so evidence and coverage position describe the same intervention. Dense top-8, newest-first, no reranker (bge-reranker isn't trained on clinical text). Empty join → "Insufficient Evidence" rather than unrelated abstracts.
+- **Synthesis:** `gemini-2.5-flash` emits a structured report — CMS Coverage Position · Clinical Evidence (`PMID` bullets) · Evidence Grade · Alignment (Aligned / Partially / Conflicting / Coverage Gap / Inverse Gap / Insufficient) · Gap Summary. The prompt forbids citing un-retrieved PMIDs.
+- **Evidence corpus:** 2,457 PubMed abstracts (`pubmed_evidence` collection) across 294 NCD topics via NCBI E-utilities.
+
+</details>
+
+<details>
+<summary><strong>Gap evaluation (independent judge)</strong></summary>
+
+Reference labels come from an **independent `gemini-2.5-flash-lite` judge** that reads the raw NCD + abstracts — never the pipeline's own report — so the eval isn't graded against itself.
+
+| Metric | Measures |
+|---|---|
+| `alignment_accuracy` | End-to-end: right alignment **and** right NCD retrieved |
+| `alignment_label_match` | Diagnostic: raw label agreement (retrieval-blind) |
+| `ncd_recall` | Expected NCD surfaced by retrieval |
+| `pmid_recall` | Fraction of key reference PMIDs cited |
+| `citation_precision` | Fraction of cited PMIDs that were actually retrieved |
+| `faithfulness` | RAGAS faithfulness vs policy + PubMed contexts |
+
+`alignment_accuracy = label_match ∧ ncd_recall`, so the metrics decompose failures into retrieval vs reasoning.
+
+```bash
+python -m src.ingestion.fetch_pubmed         # fetch PubMed abstracts
+python -m src.rag.pubmed_indexer             # build pubmed_evidence collection
+python -m src.evaluation.generate_golden_gap # independent reference labels
+python -m src.evaluation.judge_gap           # score the gap pipeline
+```
+
+</details>
+
+---
+
 ## Project Structure
 
 ```
 src/
 ├── ingestion/
-│   └── fetch.py              # CMS API client — NCDs and LCDs
+│   ├── fetch.py              # CMS API client — NCDs and LCDs
+│   └── fetch_pubmed.py       # PubMed via NCBI E-utilities (Phase 2)
 ├── rag/
 │   ├── embedder.py           # HuggingFace embedding wrapper
 │   ├── indexer.py            # ChromaDB build + load (cms_coverage collection)
-│   └── pipeline.py           # Hybrid retrieval + reranking + Gemini generation
+│   ├── pubmed_indexer.py     # ChromaDB build + load (pubmed_evidence) (Phase 2)
+│   └── pipeline.py           # Hybrid retrieval, reranking, generation, gap_analysis
 ├── evaluation/
-│   ├── generate_golden.py    # Synthetic dataset generation (198 pairs)
-│   └── judge.py              # RAGAS evaluation pipeline
+│   ├── generate_golden.py        # Synthetic Q&A dataset (198 pairs)
+│   ├── generate_golden_gap.py    # Independent gap reference labels (Phase 2)
+│   ├── judge.py                  # RAGAS evaluation — Policy Q&A
+│   └── judge_gap.py              # Gap analysis evaluation (Phase 2)
 └── ui/
-    └── app.py                # Streamlit chat interface
+    └── app.py                # Streamlit chat UI — auto-routes Q&A vs gap
 
 data/                         # committed to git
 ├── ncd_raw.json              # Raw NCD data from CMS API
 ├── lcd_raw.json              # Raw LCD data from CMS API
-└── chroma/                   # ChromaDB — cms_coverage collection (1983 chunks)
+└── chroma/                   # ChromaDB — cms_coverage (1983) + pubmed_evidence (2457)
 
 data/                         # gitignored
-├── pubmed_raw.json           # PubMed abstracts (Phase 2 — branch: phase-2)
-└── golden_dataset.json       # 198-pair evaluation set (79 NCD, 119 LCD)
+├── pubmed_raw.json           # PubMed abstracts (Phase 2)
+├── golden_dataset.json       # 198-pair Q&A eval set (79 NCD, 119 LCD)
+├── gap_questions.json        # Cached gap questions (Phase 2)
+└── golden_gap.json           # Gap eval set — independent labels (Phase 2)
 
 logs/                         # gitignored
 ├── eval_results.jsonl        # Aggregate scores per run
