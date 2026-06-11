@@ -70,11 +70,53 @@ coverage policy aligns with the published clinical evidence for ONE topic.
 Read the CMS policy text and the PubMed abstracts below, then decide the alignment \
 using EXACTLY one of these labels:
 - Aligned — CMS coverage matches what the evidence supports
-- Partially Aligned — broadly consistent but with notable caveats or mismatched scope
-- Conflicting — CMS position and the evidence point in opposite directions
-- Coverage Gap — evidence supports the intervention but CMS does not cover it
-- Inverse Gap — CMS covers it but the clinical evidence is weak or absent
-- Insufficient Evidence — too few/weak abstracts to judge alignment at all
+- Partially Aligned — same overall direction, but scope/criteria mismatch (e.g. CMS \
+covers a narrower population, stricter thresholds, or fewer indications than the \
+evidence supports)
+- Conflicting — opposite directions: CMS covers what the evidence says does not work, \
+or CMS's stated rationale contradicts the evidence
+- Coverage Gap — evidence supports the intervention but CMS explicitly does not cover \
+it (a non-coverage position, not mere narrowness)
+- Inverse Gap — CMS covers it but the retrieved evidence is weak, absent, or negative
+- Insufficient Evidence — fewer than 2 abstracts actually address this intervention's \
+clinical outcomes (off-topic or methods-only abstracts do not count)
+
+Decision rules for the confusable boundaries:
+- Partially Aligned vs Conflicting: if CMS and the evidence agree the intervention \
+works but disagree on WHO/WHEN it is appropriate, that is Partially Aligned. \
+Conflicting requires opposite conclusions about whether it works at all.
+- Coverage Gap vs Conflicting: Coverage Gap requires an explicit CMS non-coverage \
+position on something the evidence supports. If CMS covers it (even restrictively), \
+it is never a Coverage Gap.
+- Insufficient Evidence is about the ABSTRACTS' quantity/relevance, not the quality \
+of CMS's policy. Apply it before any other label.
+
+Calibration examples (illustrative only — cite ONLY PMIDs from the abstracts below):
+
+Example 1 — CMS covers home oxygen for patients with PO2 <= 55 mmHg; abstracts show \
+benefit in severe hypoxemia AND moderate hypoxemia (56-65 mmHg).
+ALIGNMENT: Partially Aligned
+RATIONALE: Both agree oxygen therapy works, but the evidence supports a broader \
+eligible population than CMS's threshold permits — a scope mismatch, not opposite \
+conclusions.
+
+Example 2 — CMS explicitly lists thermography as non-covered; abstracts are two RCTs \
+showing diagnostic accuracy comparable to standard imaging.
+ALIGNMENT: Coverage Gap
+RATIONALE: Explicit non-coverage of an intervention the retrieved evidence supports.
+
+Example 3 — CMS covers vertebroplasty for osteoporotic fractures; the retrieved \
+abstracts are two sham-controlled RCTs finding no benefit over placebo.
+ALIGNMENT: Conflicting
+RATIONALE: CMS covers it while the evidence concludes it does not work — opposite \
+directions on efficacy, not a scope question.
+
+Example 4 — CMS covers a device for heart-failure monitoring; the only retrieved \
+abstracts are one case report and one engineering-methods paper with no clinical \
+outcomes.
+ALIGNMENT: Insufficient Evidence
+RATIONALE: Fewer than 2 abstracts address clinical outcomes for this intervention, \
+so alignment cannot be judged.
 
 Reason ONLY from the documents provided. Do not use outside knowledge of newer policy.
 
