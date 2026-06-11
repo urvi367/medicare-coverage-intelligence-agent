@@ -1,8 +1,12 @@
 """Generate a golden dataset for gap-analysis evaluation.
 
-For each NCD in ncd_raw.json, generates one evidence-seeking question via Groq,
-then runs gap_analysis() once to obtain reference labels (alignment, NCD cited,
-PMIDs cited). Saved to data/golden_gap.json. Supports resuming.
+For each NCD, generates one evidence-seeking question via Groq, then labels the
+reference alignment with an INDEPENDENT Gemini judge that reads the raw NCD policy
+text + the abstracts for that NCD — NOT the pipeline's own gap report. This breaks
+the circularity of grading the pipeline against its own output: the reference label
+is produced by a separate prompt reasoning from raw evidence.
+
+Saved to data/golden_gap.json. Supports resuming.
 """
 
 import json
@@ -24,6 +28,20 @@ NCD_PATH = Path(__file__).parents[2] / "data" / "ncd_raw.json"
 _GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 _GROQ_MODEL = "llama-3.1-8b-instant"
 
+# Independent labeler. Reads raw NCD + abstracts; never sees the pipeline's report.
+LABEL_MODEL = "gemini-2.5-flash"
+
+# Alignment rubric — MUST match the labels the pipeline emits (_GAP_SYSTEM) so the
+# pipeline's output can be compared against the reference.
+_ALIGNMENT_LABELS = [
+    "Aligned",
+    "Partially Aligned",
+    "Conflicting",
+    "Coverage Gap",
+    "Inverse Gap",
+    "Insufficient Evidence",
+]
+
 _QUESTION_PROMPT = """\
 You are generating evaluation data for a Medicare coverage intelligence system.
 
@@ -37,6 +55,32 @@ that:
 NCD title: {title}
 
 Respond with ONLY the question, no explanation."""
+
+_LABEL_PROMPT = """\
+You are a senior Medicare evidence reviewer. Independently judge how well CMS \
+coverage policy aligns with the published clinical evidence for ONE topic.
+
+Read the CMS policy text and the PubMed abstracts below, then decide the alignment \
+using EXACTLY one of these labels:
+- Aligned — CMS coverage matches what the evidence supports
+- Partially Aligned — broadly consistent but with notable caveats or mismatched scope
+- Conflicting — CMS position and the evidence point in opposite directions
+- Coverage Gap — evidence supports the intervention but CMS does not cover it
+- Inverse Gap — CMS covers it but the clinical evidence is weak or absent
+- Insufficient Evidence — too few/weak abstracts to judge alignment at all
+
+Reason ONLY from the documents provided. Do not use outside knowledge of newer policy.
+
+Respond in EXACTLY this format:
+ALIGNMENT: <one label from the list above>
+KEY_PMIDS: <comma-separated PMIDs most decisive for your judgment, or NONE>
+RATIONALE: <one sentence>
+
+CMS POLICY ({ncd_number} — {ncd_title}):
+{ncd_text}
+
+PUBMED ABSTRACTS:
+{abstracts}"""
 
 
 def _groq_question(title: str) -> str:
@@ -56,33 +100,102 @@ def _groq_question(title: str) -> str:
     return r.json()["choices"][0]["message"]["content"].strip()
 
 
-def _parse_alignment(text: str) -> str:
-    """Extract the Alignment label from a structured gap report."""
-    m = re.search(r"Alignment:\s*\**(.+?)\**(?:\n|$)", text)
-    return m.group(1).strip() if m else ""
+def _abstracts_for_ncd(pubmed_db, ncd_number: str, limit: int = 12) -> list[dict]:
+    """Return up to `limit` abstract dicts (pmid, year, journal, text) for an NCD."""
+    if not ncd_number:
+        return []
+    got = pubmed_db.get(where={"source_ncd_number": ncd_number}, include=["documents", "metadatas"])
+    out = []
+    for text, meta in zip(got["documents"], got["metadatas"]):
+        out.append({
+            "pmid": meta.get("pmid", ""),
+            "year": meta.get("year", ""),
+            "journal": meta.get("journal", ""),
+            "text": text,
+        })
+    return out[:limit]
 
 
-def _parse_pmids(text: str) -> list[str]:
-    """Extract PMIDs cited in a gap report."""
-    return list(set(re.findall(r"PMID\s*(\d+)", text, re.IGNORECASE)))
+def _format_abstracts(abstracts: list[dict]) -> str:
+    if not abstracts:
+        return "No abstracts retrieved for this topic."
+    parts = []
+    for a in abstracts:
+        header = f"PMID {a['pmid']} ({a.get('year') or '?'}, {a.get('journal') or '?'})"
+        parts.append(f"{header}\n{a['text'][:600]}")
+    return "\n\n---\n\n".join(parts)
+
+
+def _parse_label(text: str) -> dict:
+    """Parse the structured judge response into alignment, key_pmids, rationale."""
+    align_m = re.search(r"ALIGNMENT:\s*(.+)", text)
+    pmid_m = re.search(r"KEY_PMIDS:\s*(.+)", text)
+    rat_m = re.search(r"RATIONALE:\s*(.+)", text)
+
+    alignment = align_m.group(1).strip() if align_m else ""
+    # Normalize to a canonical rubric label (judge may add trailing punctuation/notes).
+    canon = next((lab for lab in _ALIGNMENT_LABELS if lab.lower() in alignment.lower()), alignment)
+
+    pmids: list[str] = []
+    if pmid_m and "none" not in pmid_m.group(1).lower():
+        pmids = re.findall(r"\d{5,}", pmid_m.group(1))
+
+    return {
+        "alignment": canon,
+        "key_pmids": pmids,
+        "rationale": rat_m.group(1).strip() if rat_m else "",
+    }
+
+
+def _judge_alignment(ncd_number: str, ncd_title: str, ncd_text: str, abstracts: list[dict]) -> dict:
+    """Independently label alignment from raw NCD text + abstracts via Gemini."""
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
+    llm = ChatGoogleGenerativeAI(model=LABEL_MODEL, temperature=0)
+    prompt = _LABEL_PROMPT.format(
+        ncd_number=ncd_number,
+        ncd_title=ncd_title,
+        ncd_text=ncd_text[:3000],
+        abstracts=_format_abstracts(abstracts),
+    )
+    for attempt in range(8):
+        try:
+            return _parse_label(llm.invoke(prompt).content)
+        except Exception as exc:
+            s = str(exc)
+            # A monthly spending cap won't clear on retry — fail fast so generation
+            # stops cleanly instead of backing off for minutes per call.
+            if "spend" in s.lower() or "spending cap" in s.lower():
+                raise RuntimeError(
+                    "Gemini monthly spending cap exceeded — raise the cap at "
+                    "https://ai.studio/spend, then re-run (golden gen resumes)."
+                ) from exc
+            m = re.search(r"retryDelay['\"]:\s*['\"](\d+(?:\.\d+)?)s", s)
+            retryable = bool(m) or any(t in s for t in ("429", "RESOURCE_EXHAUSTED", "503", "SERVICE_UNAVAILABLE"))
+            if not retryable or attempt == 7:
+                raise
+            wait = float(m.group(1)) + 2 if m else min(2 ** attempt * 5, 60)
+            logger.warning("Labeler rate limited — waiting %.0fs", wait)
+            time.sleep(wait)
 
 
 def generate(max_ncds: int | None = None) -> list[dict]:
-    """Generate gap golden dataset from NCD topics.
+    """Generate gap golden dataset with independently-labeled reference alignment.
 
     Args:
         max_ncds: Cap on number of NCDs to process (None = all).
 
     Returns:
-        List of golden gap records, each with question, topic, expected_ncd,
-        expected_alignment, reference_pmids, and reference_report.
+        List of golden gap records.
     """
-    from src.rag.pipeline import gap_analysis
+    from src.rag.pubmed_indexer import load_pubmed_index
 
     ncd_records = json.loads(NCD_PATH.read_text(encoding="utf-8"))
     ncds = [r for r in ncd_records if r.get("title") and r.get("text")]
     if max_ncds:
         ncds = ncds[:max_ncds]
+
+    pubmed_db = load_pubmed_index()
 
     existing: list[dict] = []
     if GOLDEN_GAP_PATH.exists():
@@ -97,40 +210,40 @@ def generate(max_ncds: int | None = None) -> list[dict]:
             logger.info("  Skipping [%d/%d] (done): %s", i, len(ncds), ncd["title"][:60])
             continue
 
-        logger.info("  Generating [%d/%d]: %s", i, len(ncds), ncd["title"][:60])
+        logger.info("  Labeling [%d/%d]: %s", i, len(ncds), ncd["title"][:60])
+
+        abstracts = _abstracts_for_ncd(pubmed_db, policy_number)
+        if not abstracts:
+            logger.info("    No abstracts for %s — skipping (no evidence to judge)", policy_number)
+            continue
 
         try:
             question = _groq_question(ncd["title"])
         except Exception as e:
             logger.warning("Groq failed for %s: %s — skipping", ncd["title"][:40], e)
             continue
-
-        time.sleep(0.4)  # Groq free tier: ~30 RPM
+        time.sleep(0.4)  # Groq free tier headroom
 
         try:
-            result = gap_analysis(question)
+            label = _judge_alignment(policy_number, ncd["title"], ncd["text"], abstracts)
         except Exception as e:
-            logger.warning("gap_analysis failed: %s — skipping", e)
+            logger.warning("Labeler failed: %s — skipping", e)
             continue
-
-        time.sleep(1.0)  # Gemini rate-limit headroom
+        time.sleep(1.0)  # Gemini headroom
 
         record = {
             "question": question,
             "topic": ncd["title"],
             "expected_ncd": policy_number,
-            "expected_alignment": _parse_alignment(result["gap_report"]),
-            "reference_pmids": _parse_pmids(result["gap_report"]),
-            "reference_report": result["gap_report"],
+            "reference_alignment": label["alignment"],
+            "reference_rationale": label["rationale"],
+            "reference_pmids": label["key_pmids"],
+            "n_abstracts_judged": len(abstracts),
         }
         existing.append(record)
         done_ncds.add(policy_number)
         GOLDEN_GAP_PATH.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-        logger.info(
-            "    Alignment: %s | PMIDs: %s",
-            record["expected_alignment"],
-            record["reference_pmids"],
-        )
+        logger.info("    → %s | key PMIDs: %s", record["reference_alignment"], record["reference_pmids"])
 
     logger.info("Done — %d gap golden records at %s", len(existing), GOLDEN_GAP_PATH)
     return existing

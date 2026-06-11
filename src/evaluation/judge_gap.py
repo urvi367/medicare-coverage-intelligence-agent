@@ -102,7 +102,7 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
         cached.append({
             "question": item["question"],
             "expected_ncd": item["expected_ncd"],
-            "expected_alignment": item["expected_alignment"],
+            "reference_alignment": item["reference_alignment"],
             "reference_pmids": item.get("reference_pmids", []),
             "gap_report": result["gap_report"],
             "policy_contexts": [d.page_content for d in result["policy_sources"]],
@@ -118,15 +118,17 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
     for item in cached:
         report = item["gap_report"]
         actual_alignment = _parse_alignment(report)
-        expected_alignment = item.get("expected_alignment", "")
+        reference_alignment = item.get("reference_alignment", "")
         ncds_cited = _parse_ncd_numbers(report)
         pmids_cited = _parse_pmids(report)
         ref_pmids = set(item.get("reference_pmids", []))
 
+        # Compare the pipeline's alignment against the INDEPENDENT judge's reference
+        # label (from generate_golden_gap), not against the pipeline's own prior run.
         alignment_match = (
             1.0
-            if actual_alignment and expected_alignment
-            and actual_alignment.lower() == expected_alignment.lower()
+            if actual_alignment and reference_alignment
+            and actual_alignment.lower() == reference_alignment.lower()
             else 0.0
         )
         ncd_recall = 1.0 if item["expected_ncd"] and item["expected_ncd"] in ncds_cited else 0.0
@@ -142,7 +144,7 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
 
         rows.append({
             "question": item["question"],
-            "expected_alignment": expected_alignment,
+            "reference_alignment": reference_alignment,
             "actual_alignment": actual_alignment,
             "alignment_accuracy": alignment_match,
             "ncd_recall": ncd_recall,
