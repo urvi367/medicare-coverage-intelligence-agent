@@ -70,6 +70,9 @@ _FEEDBACK_LABELS = {
 }
 
 
+_ALIGNMENT_RE = re.compile(r"Alignment:\s*\**(.+?)\**(?:\n|$)")
+
+
 def _log_interaction(
     question: str,
     answer_text: str,
@@ -77,38 +80,48 @@ def _log_interaction(
     mode: str,
     pubmed_sources: list | None = None,
 ) -> None:
-    entry = {
+    policy_source_list = [
+        {
+            "title": s.metadata.get("title", ""),
+            "policy_number": s.metadata.get("policy_number", ""),
+            "source": s.metadata.get("source", ""),
+            "excerpt": s.page_content,
+        }
+        for s in sources
+    ]
+    entry: dict = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "mode": mode,
         "question": question,
         "answer": answer_text,
-        "sources": [
-            {
-                "title": s.metadata.get("title", ""),
-                "policy_number": s.metadata.get("policy_number", ""),
-                "source": s.metadata.get("source", ""),
-            }
-            for s in sources
-        ],
     }
-    if pubmed_sources:
-        entry["pubmed_sources"] = [
-            {
-                "pmid": s.metadata.get("pmid", ""),
-                "title": s.metadata.get("title", ""),
-                "year": s.metadata.get("year", ""),
-                "journal": s.metadata.get("journal", ""),
-            }
-            for s in pubmed_sources
-        ]
+    if mode == "gap":
+        entry["policy_sources"] = policy_source_list
+        m = _ALIGNMENT_RE.search(answer_text)
+        if m:
+            entry["alignment"] = m.group(1).strip()
+        if pubmed_sources:
+            entry["pubmed_sources"] = [
+                {
+                    "pmid": s.metadata.get("pmid", ""),
+                    "title": s.metadata.get("title", ""),
+                    "year": s.metadata.get("year", ""),
+                    "journal": s.metadata.get("journal", ""),
+                    "excerpt": s.page_content,
+                }
+                for s in pubmed_sources
+            ]
+    else:
+        entry["sources"] = policy_source_list
     with LOG_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 
 
-def _log_feedback(question: str, rating: str) -> None:
+def _log_feedback(question: str, rating: str, mode: str = "") -> None:
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "type": "feedback",
+        "mode": mode,
         "question": question,
         "rating": rating,
         "label": _FEEDBACK_LABELS[rating],
@@ -117,7 +130,7 @@ def _log_feedback(question: str, rating: str) -> None:
         f.write(json.dumps(entry) + "\n")
 
 
-def _render_feedback(msg_index: int, question: str) -> None:
+def _render_feedback(msg_index: int, question: str, mode: str = "") -> None:
     if "feedback" not in st.session_state:
         st.session_state.feedback = {}
     if msg_index in st.session_state.feedback:
@@ -127,7 +140,7 @@ def _render_feedback(msg_index: int, question: str) -> None:
     for col, (key, label) in zip(cols, _FEEDBACK_LABELS.items()):
         if col.button(label, key=f"fb_{msg_index}_{key}"):
             st.session_state.feedback[msg_index] = key
-            _log_feedback(question, key)
+            _log_feedback(question, key, mode=mode)
             st.rerun()
 
 
@@ -213,7 +226,8 @@ for i, msg in enumerate(st.session_state.messages):
             _render_sources(msg["sources"])
         if msg["role"] == "assistant":
             question = st.session_state.messages[i - 1]["content"] if i > 0 else ""
-            _render_feedback(i, question)
+            msg_mode = st.session_state.messages[i - 1].get("mode", "") if i > 0 else ""
+            _render_feedback(i, question, mode=msg_mode)
 
 # ── Handle new input ──────────────────────────────────────────────────────────
 
@@ -239,7 +253,7 @@ if prompt := st.chat_input("Ask a coverage question or request an evidence gap a
             sources = _source_meta(result["sources"])
             _render_sources(sources)
             new_index = len(st.session_state.messages)
-            _render_feedback(new_index, prompt)
+            _render_feedback(new_index, prompt, mode="policy")
 
             st.session_state.messages.append(
                 {"role": "assistant", "content": result["answer"], "sources": sources}
@@ -260,7 +274,7 @@ if prompt := st.chat_input("Ask a coverage question or request an evidence gap a
             _render_sources(policy_sources, "CMS Policy Sources")
             _render_sources(pubmed_sources, "PubMed Evidence")
             new_index = len(st.session_state.messages)
-            _render_feedback(new_index, prompt)
+            _render_feedback(new_index, prompt, mode="gap")
 
             st.session_state.messages.append({
                 "role": "assistant",
