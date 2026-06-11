@@ -107,6 +107,9 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
             "gap_report": result["gap_report"],
             "policy_contexts": [d.page_content for d in result["policy_sources"]],
             "pubmed_contexts": [d.page_content for d in result["pubmed_sources"]],
+            "pubmed_pmids": [
+                d.metadata.get("pmid", "") for d in result["pubmed_sources"] if d.metadata.get("pmid")
+            ],
         })
         cache_path.write_text(json.dumps(cached, indent=2), encoding="utf-8")
 
@@ -130,6 +133,12 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
         pmid_recall = (
             len(pmids_cited & ref_pmids) / len(ref_pmids) if ref_pmids else None
         )
+        # citation precision: every PMID cited in the report must have been retrieved.
+        # Catches fabricated/hallucinated citations. None when the report cites no PMIDs.
+        retrieved_pmids = set(item.get("pubmed_pmids", []))
+        citation_precision = (
+            len(pmids_cited & retrieved_pmids) / len(pmids_cited) if pmids_cited else None
+        )
 
         rows.append({
             "question": item["question"],
@@ -138,6 +147,7 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
             "alignment_accuracy": alignment_match,
             "ncd_recall": ncd_recall,
             "pmid_recall": pmid_recall,
+            "citation_precision": citation_precision,
         })
 
     # ── RAGAS faithfulness ─────────────────────────────────────────────────────
@@ -162,10 +172,13 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
         if i > 1:
             time.sleep(1.0)
         logger.info("  Judging faithfulness [%d/%d]", i, len(ragas_items))
+        # Faithfulness over BOTH context sets — the report makes claims about CMS
+        # policy AND clinical evidence; checking only policy would miss fabricated
+        # findings on the PubMed side (the higher hallucination risk).
         sample = EvaluationDataset(samples=[SingleTurnSample(
             user_input=item["question"],
             response=item["gap_report"],
-            retrieved_contexts=item["policy_contexts"],
+            retrieved_contexts=item["policy_contexts"] + item["pubmed_contexts"],
         )])
         for attempt in range(10):
             try:
@@ -190,6 +203,8 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
     scores["ncd_recall"] = round(float(rows_df["ncd_recall"].mean()), 3)
     if rows_df["pmid_recall"].notna().any():
         scores["pmid_recall"] = round(float(rows_df["pmid_recall"].mean(skipna=True)), 3)
+    if rows_df["citation_precision"].notna().any():
+        scores["citation_precision"] = round(float(rows_df["citation_precision"].mean(skipna=True)), 3)
     scores["n"] = len(cached)
 
     logger.info("Gap eval scores (%d samples): %s", len(cached), scores)

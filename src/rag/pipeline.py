@@ -170,6 +170,23 @@ def _hybrid_retrieve_pubmed(query: str, k: int) -> list[Document]:
     return [doc_map[k_] for k_ in ranked[:k]]
 
 
+def _pubmed_for_ncds(query: str, ncd_numbers: set[str], k: int) -> list[Document]:
+    """Retrieve PubMed abstracts restricted to specific NCD topics, ranked by query.
+
+    Guarantees topical alignment: every abstract was originally fetched for one of
+    the NCDs surfaced on the policy side (matched via source_ncd_number == the NCD's
+    policy_number), so the evidence set and the coverage position describe the same
+    intervention. No score threshold — the NCD filter already enforces topicality;
+    we only rank the small per-NCD abstract pool by query relevance.
+    """
+    if not ncd_numbers:
+        return []
+    db = _get_pubmed_db()
+    nums = list(ncd_numbers)
+    flt = {"source_ncd_number": nums[0]} if len(nums) == 1 else {"source_ncd_number": {"$in": nums}}
+    return db.similarity_search(query, k=k, filter=flt)
+
+
 def _rerank(query: str, docs: list[Document], top_n: int = 3) -> list[Document]:
     """Score (query, doc) pairs with a cross-encoder and return the top_n docs."""
     if not docs:
@@ -328,9 +345,16 @@ _GAP_SYSTEM = (
     "Evidence Grade: [Strong — RCT or meta-analysis | Moderate — cohort or observational | Weak / Insufficient]\n\n"
     "Alignment: [Aligned | Partially Aligned | Conflicting | "
     "Coverage Gap — evidence supports but CMS does not cover | "
-    "Inverse Gap — CMS covers but clinical evidence is weak]\n\n"
+    "Inverse Gap — CMS covers but clinical evidence is weak | "
+    "Insufficient Evidence — no clinical evidence retrieved]\n\n"
     "Gap Summary: [2–3 sentences: where CMS policy and evidence agree or diverge, "
     "and the practical implication for coverage decisions.]\n\n"
+    "IMPORTANT: If no PubMed abstracts are provided below (the section reads 'No PubMed "
+    "abstracts retrieved'), you MUST set Evidence Grade to 'Insufficient' and Alignment "
+    "to 'Insufficient Evidence — no clinical evidence retrieved'. Do not infer an "
+    "alignment verdict without evidence.\n\n"
+    "Cite ONLY PMIDs that appear in the PubMed Abstracts section below. Never invent a "
+    "PMID, year, or finding not present in the provided abstracts.\n\n"
     "CMS Policy Documents:\n{policy_context}\n\n"
     "PubMed Abstracts:\n{pubmed_context}"
 )
@@ -368,10 +392,23 @@ def gap_analysis(
         top_n=PIPELINE_CONFIG["reranker_top_n"],
     )
 
+    # Topical join: pull evidence only for the NCD(s) surfaced on the policy side,
+    # so the abstracts and the coverage position are guaranteed to be about the
+    # same intervention (rather than two independent searches that may diverge).
+    ncd_numbers = {
+        d.metadata.get("policy_number")
+        for d in policy_docs
+        if d.metadata.get("policy_number")
+    }
+
     try:
-        # k=8 hybrid candidates used directly — no cross-encoder reranking.
-        # bge-reranker-base is trained on web passages, not clinical abstracts.
-        pubmed_docs: list[Document] = _hybrid_retrieve_pubmed(question, k=8)
+        pubmed_docs: list[Document] = _pubmed_for_ncds(question, ncd_numbers, k=8)
+        if not pubmed_docs:
+            # No abstracts indexed for these NCDs — fall back to an open hybrid
+            # search so the report still has evidence to reason over (no topical
+            # guarantee in this path).
+            logger.info("No NCD-matched abstracts — falling back to open hybrid PubMed search")
+            pubmed_docs = _hybrid_retrieve_pubmed(question, k=8)
         # Sort newest-first so Gemini weights recent evidence more heavily.
         pubmed_docs.sort(key=lambda d: d.metadata.get("year", "0"), reverse=True)
     except RuntimeError:
