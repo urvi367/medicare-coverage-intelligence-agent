@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,25 @@ def _search_pmids(query: str, max_results: int = 10) -> list[str]:
         return []
 
 
+def _extract_year(article: ElementTree.Element) -> str:
+    """Extract a 4-digit publication year from a PubmedArticle element.
+
+    NOTE: ElementTree treats a childless Element (like <Year>2020</Year>) as falsy,
+    so `find(a) or find(b)` silently skips a real <Year>. Use explicit None checks.
+    """
+    for path in (".//Article//PubDate/Year", ".//PubDate/Year", ".//ArticleDate/Year"):
+        el = article.find(path)
+        if el is not None and el.text and el.text.strip():
+            return el.text.strip()[:4]
+    # MedlineDate is free-form, e.g. "2020 Jan-Feb" or "Spring 2021" — pull first year.
+    md = article.find(".//PubDate/MedlineDate")
+    if md is not None and md.text:
+        m = re.search(r"\b(\d{4})\b", md.text)
+        if m:
+            return m.group(1)
+    return ""
+
+
 def _fetch_abstracts(pmids: list[str]) -> list[dict[str, Any]]:
     """Fetch PubMed XML for a list of PMIDs and parse into dicts."""
     if not pmids:
@@ -70,11 +90,7 @@ def _fetch_abstracts(pmids: list[str]) -> list[dict[str, Any]]:
         abstract_parts = article.findall(".//AbstractText")
         abstract = " ".join("".join(el.itertext()) for el in abstract_parts).strip()
 
-        year_el = (
-            article.find(".//PubDate/Year")
-            or article.find(".//PubDate/MedlineDate")
-        )
-        year = year_el.text[:4] if year_el is not None and year_el.text else ""
+        year = _extract_year(article)
 
         journal_el = article.find(".//Journal/Title")
         journal = journal_el.text if journal_el is not None else ""
@@ -137,6 +153,59 @@ def fetch_and_save(max_per_topic: int = 10) -> Path:
     out.write_text(json.dumps(all_records, indent=2), encoding="utf-8")
     logger.info("Saved %d unique abstracts to %s", len(all_records), out)
     return out
+
+
+def _fetch_years(pmids: list[str]) -> dict[str, str]:
+    """Efetch a batch of PMIDs and return {pmid: year} for those with a parseable year."""
+    if not pmids:
+        return {}
+    params = {"db": "pubmed", "id": ",".join(pmids), "rettype": "abstract"}
+    try:
+        r = _session.get(EFETCH_URL, params=params, timeout=60)
+        r.raise_for_status()
+        root = ElementTree.fromstring(r.content)
+    except Exception as e:
+        logger.warning("efetch (years) failed for %d pmids: %s", len(pmids), e)
+        return {}
+    years: dict[str, str] = {}
+    for article in root.findall(".//PubmedArticle"):
+        pmid_el = article.find(".//PMID")
+        pmid = pmid_el.text if pmid_el is not None else ""
+        year = _extract_year(article)
+        if pmid and year:
+            years[pmid] = year
+    return years
+
+
+def backfill_years(batch_size: int = 200) -> Path:
+    """Backfill missing years onto existing pubmed_raw.json records (no re-search).
+
+    Re-fetches only the dates for PMIDs already saved, preserving the exact dataset.
+    Run `python -m src.rag.pubmed_indexer` afterward to rebuild the index.
+    """
+    path = DATA_DIR / "pubmed_raw.json"
+    records = json.loads(path.read_text(encoding="utf-8"))
+    pmids = [r["pmid"] for r in records if r.get("pmid")]
+    logger.info("Backfilling years for %d PMIDs in batches of %d...", len(pmids), batch_size)
+
+    year_map: dict[str, str] = {}
+    for i in range(0, len(pmids), batch_size):
+        batch = pmids[i:i + batch_size]
+        time.sleep(_DELAY)
+        year_map.update(_fetch_years(batch))
+        logger.info("  [%d/%d] resolved %d years so far", min(i + batch_size, len(pmids)), len(pmids), len(year_map))
+
+    filled = 0
+    for r in records:
+        y = year_map.get(r.get("pmid", ""))
+        if y and not r.get("year"):
+            r["year"] = y
+            filled += 1
+
+    path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+    still_empty = sum(1 for r in records if not r.get("year"))
+    logger.info("Filled %d years; %d still empty. Saved %s", filled, still_empty, path)
+    return path
 
 
 def load_documents() -> list[dict[str, str]]:
