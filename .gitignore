@@ -3,9 +3,12 @@ __pycache__/
 *.pyc
 *.pyo
 .chroma/
-data/
 logs/
 .venv/
 venv/
 agent/
 *.docx
+
+# data — commit index + raw CMS data, ignore eval/pubmed artifacts
+data/pubmed_raw.json
+data/golden_dataset.json

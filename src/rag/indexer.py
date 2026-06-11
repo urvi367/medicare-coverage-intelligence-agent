@@ -135,6 +135,12 @@ def build_index() -> Chroma:
             chunk.page_content = f"{title}\n{chunk.page_content}"
         chunk.page_content = _expand_synonyms(chunk.page_content)
 
+    before = len(chunks)
+    chunks = [c for c in chunks if c.page_content.strip()]
+    dropped = before - len(chunks)
+    if dropped:
+        logger.warning("Dropped %d blank/whitespace-only chunks before indexing", dropped)
+
     # Chroma.from_documents APPENDS — it assigns fresh IDs rather than replacing.
     # Wipe the persisted index first so rebuilds don't accumulate stale duplicates
     # (e.g. chunks from a previous, pre-fix ingestion).

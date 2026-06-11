@@ -80,7 +80,9 @@ def _render_sources(sources: list[dict]) -> None:
     with st.expander("Sources"):
         for s in sources:
             label = s.get("title") or s.get("policy_number") or "Unknown"
-            st.markdown(f"- **{label}** `{s.get('source','')} {s.get('policy_number','')}`")
+            st.markdown(f"**{label}** `{s.get('source','')} {s.get('policy_number','')}`")
+            if excerpt := s.get("excerpt"):
+                st.caption(excerpt)
 
 
 # ── Page config ──────────────────────────────────────────────────────────────
@@ -138,6 +140,7 @@ if prompt := st.chat_input("Ask a Medicare coverage question..."):
                 "title": s.metadata.get("title", ""),
                 "policy_number": s.metadata.get("policy_number", ""),
                 "source": s.metadata.get("source", ""),
+                "excerpt": s.page_content,
             }
             for s in result["sources"]
         ]

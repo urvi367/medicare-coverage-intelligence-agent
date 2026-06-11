@@ -9,6 +9,7 @@ from typing import Any
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_google_genai.chat_models import ChatGoogleGenerativeAIError
+from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -26,6 +27,15 @@ PIPELINE_CONFIG = {
 }
 
 _reranker: CrossEncoder | None = None
+_bm25: BM25Retriever | None = None
+_db = None  # cached Chroma instance — avoid reopening on every query
+
+
+def _get_db():
+    global _db
+    if _db is None:
+        _db = load_index()
+    return _db
 
 
 def _get_reranker() -> CrossEncoder:
@@ -33,6 +43,46 @@ def _get_reranker() -> CrossEncoder:
     if _reranker is None:
         _reranker = CrossEncoder("BAAI/bge-reranker-base")
     return _reranker
+
+
+def _get_bm25(k: int) -> BM25Retriever:
+    """Build (once) and return a BM25 retriever over the full CMS index."""
+    global _bm25
+    if _bm25 is None:
+        result = _get_db().get(include=["documents", "metadatas"])
+        docs = [
+            Document(page_content=text, metadata=meta)
+            for text, meta in zip(result["documents"], result["metadatas"])
+        ]
+        _bm25 = BM25Retriever.from_documents(docs)
+        logger.info("BM25 index built over %d chunks", len(docs))
+    _bm25.k = k
+    return _bm25
+
+
+def _hybrid_retrieve(query: str, k: int) -> list[Document]:
+    """Fuse BM25 (sparse) + dense vector results via Reciprocal Rank Fusion."""
+    db = _get_db()
+    dense_docs = db.as_retriever(
+        search_type="similarity_score_threshold",
+        search_kwargs={"k": k, "score_threshold": PIPELINE_CONFIG["threshold"]},
+    ).invoke(query)
+    bm25_docs = _get_bm25(k).invoke(query)
+
+    # RRF constant k=60 is standard; higher = smoother rank blending
+    scores: dict[str, float] = {}
+    doc_map: dict[str, Document] = {}
+    for rank, doc in enumerate(dense_docs):
+        key = doc.page_content
+        scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank + 1)
+        doc_map[key] = doc
+    for rank, doc in enumerate(bm25_docs):
+        key = doc.page_content
+        scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank + 1)
+        doc_map[key] = doc
+
+    ranked = sorted(scores, key=lambda x: scores[x], reverse=True)
+    return [doc_map[k_] for k_ in ranked[:k]]
 
 
 def _rerank(query: str, docs: list[Document], top_n: int = 3) -> list[Document]:
@@ -124,15 +174,12 @@ def answer(
         answer  — the generated response string
         sources — list of source Documents used
     """
-    db = load_index()
-    retriever = db.as_retriever(
-        search_type="similarity_score_threshold",
-        search_kwargs={"k": k or PIPELINE_CONFIG["k"], "score_threshold": PIPELINE_CONFIG["threshold"]},
-    )
     llm = ChatGoogleGenerativeAI(model=model, temperature=0)
 
     sources: list[Document] = _rerank(
-        question, retriever.invoke(question), top_n=PIPELINE_CONFIG["reranker_top_n"]
+        question,
+        _hybrid_retrieve(question, k or PIPELINE_CONFIG["k"]),
+        top_n=PIPELINE_CONFIG["reranker_top_n"],
     )
     context = _format_docs(sources)
     prompt = ChatPromptTemplate.from_messages(
@@ -157,6 +204,29 @@ def answer(
             )
             time.sleep(wait)
             attempt += 1
+
+
+def build_chain(model: str = "gemini-2.5-flash", k: int | None = None):
+    """Return a streaming-compatible LangChain LCEL chain (answer text only)."""
+    k_ = k or PIPELINE_CONFIG["k"]
+    llm = ChatGoogleGenerativeAI(model=model, temperature=0)
+
+    def _retrieve_and_rerank(question: str) -> list[Document]:
+        return _rerank(question, _hybrid_retrieve(question, k_), top_n=PIPELINE_CONFIG["reranker_top_n"])
+
+    def _build_prompt(inputs: dict):
+        docs = inputs["docs"]
+        prompt = ChatPromptTemplate.from_messages(
+            [("system", _build_system(docs)), ("human", "{question}")]
+        )
+        return prompt.format_messages(context=_format_docs(docs), question=inputs["question"])
+
+    return (
+        {"docs": RunnableLambda(_retrieve_and_rerank), "question": RunnablePassthrough()}
+        | RunnableLambda(_build_prompt)
+        | llm
+        | StrOutputParser()
+    )
 
 
 _GAP_SYSTEM = (
@@ -208,13 +278,9 @@ def gap_analysis(
     k_ = k or PIPELINE_CONFIG["k"]
     threshold = PIPELINE_CONFIG["threshold"]
 
-    policy_db = load_index()
     policy_docs: list[Document] = _rerank(
         question,
-        policy_db.as_retriever(
-            search_type="similarity_score_threshold",
-            search_kwargs={"k": k_, "score_threshold": threshold},
-        ).invoke(question),
+        _hybrid_retrieve(question, k_),
         top_n=PIPELINE_CONFIG["reranker_top_n"],
     )
 
@@ -261,27 +327,3 @@ def gap_analysis(
             logger.warning("Gemini rate limited — waiting %.0fs before retry #%d", wait, attempt + 1)
             time.sleep(wait)
             attempt += 1
-
-
-def build_chain(model: str = "gemini-2.5-flash", k: int | None = None):
-    """Return a streaming-compatible LangChain LCEL chain (answer text only)."""
-    db = load_index()
-    retriever = db.as_retriever(
-        search_type="similarity_score_threshold",
-        search_kwargs={"k": k or PIPELINE_CONFIG["k"], "score_threshold": PIPELINE_CONFIG["threshold"]},
-    )
-    llm = ChatGoogleGenerativeAI(model=model, temperature=0)
-
-    def _build_prompt(inputs: dict):
-        docs = _rerank(inputs["question"], inputs["docs"], top_n=PIPELINE_CONFIG["reranker_top_n"])
-        prompt = ChatPromptTemplate.from_messages(
-            [("system", _build_system(docs)), ("human", "{question}")]
-        )
-        return prompt.format_messages(context=_format_docs(docs), question=inputs["question"])
-
-    return (
-        {"docs": retriever, "question": RunnablePassthrough()}
-        | RunnableLambda(_build_prompt)
-        | llm
-        | StrOutputParser()
-    )
