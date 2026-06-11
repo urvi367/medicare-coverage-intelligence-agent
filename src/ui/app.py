@@ -70,7 +70,13 @@ _FEEDBACK_LABELS = {
 }
 
 
-def _log_interaction(question: str, answer_text: str, sources: list, mode: str) -> None:
+def _log_interaction(
+    question: str,
+    answer_text: str,
+    sources: list,
+    mode: str,
+    pubmed_sources: list | None = None,
+) -> None:
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "mode": mode,
@@ -85,6 +91,16 @@ def _log_interaction(question: str, answer_text: str, sources: list, mode: str) 
             for s in sources
         ],
     }
+    if pubmed_sources:
+        entry["pubmed_sources"] = [
+            {
+                "pmid": s.metadata.get("pmid", ""),
+                "title": s.metadata.get("title", ""),
+                "year": s.metadata.get("year", ""),
+                "journal": s.metadata.get("journal", ""),
+            }
+            for s in pubmed_sources
+        ]
     with LOG_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 
@@ -120,8 +136,17 @@ def _render_sources(sources: list[dict], label: str = "Sources") -> None:
         return
     with st.expander(label):
         for s in sources:
-            title = s.get("title") or s.get("policy_number") or "Unknown"
-            st.markdown(f"**{title}** `{s.get('source','')} {s.get('policy_number','')}`")
+            if s.get("pmid"):
+                title = s.get("title") or f"PMID {s['pmid']}"
+                meta = f"PMID {s['pmid']}"
+                if s.get("year"):
+                    meta += f" · {s['year']}"
+                if s.get("journal"):
+                    meta += f" · {s['journal']}"
+                st.markdown(f"**{title}** `{meta}`")
+            else:
+                title = s.get("title") or s.get("policy_number") or "Unknown"
+                st.markdown(f"**{title}** `{s.get('source', '')} {s.get('policy_number', '')}`")
             if excerpt := s.get("excerpt"):
                 st.caption(excerpt)
 
@@ -132,6 +157,19 @@ def _source_meta(docs) -> list[dict]:
             "title": s.metadata.get("title", ""),
             "policy_number": s.metadata.get("policy_number", ""),
             "source": s.metadata.get("source", ""),
+            "excerpt": s.page_content,
+        }
+        for s in docs
+    ]
+
+
+def _pubmed_source_meta(docs) -> list[dict]:
+    return [
+        {
+            "title": s.metadata.get("title", ""),
+            "pmid": s.metadata.get("pmid", ""),
+            "year": s.metadata.get("year", ""),
+            "journal": s.metadata.get("journal", ""),
             "excerpt": s.page_content,
         }
         for s in docs
@@ -218,7 +256,7 @@ if prompt := st.chat_input("Ask a coverage question or request an evidence gap a
 
             st.markdown(result["gap_report"])
             policy_sources = _source_meta(result["policy_sources"])
-            pubmed_sources = _source_meta(result["pubmed_sources"])
+            pubmed_sources = _pubmed_source_meta(result["pubmed_sources"])
             _render_sources(policy_sources, "CMS Policy Sources")
             _render_sources(pubmed_sources, "PubMed Evidence")
             new_index = len(st.session_state.messages)
@@ -230,4 +268,4 @@ if prompt := st.chat_input("Ask a coverage question or request an evidence gap a
                 "policy_sources": policy_sources,
                 "pubmed_sources": pubmed_sources,
             })
-            _log_interaction(prompt, result["gap_report"], result["policy_sources"], mode="gap")
+            _log_interaction(prompt, result["gap_report"], result["policy_sources"], mode="gap", pubmed_sources=result["pubmed_sources"])

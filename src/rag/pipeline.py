@@ -24,11 +24,14 @@ PIPELINE_CONFIG = {
     "threshold": 0.65,
     "reranker": "BAAI/bge-reranker-base",
     "reranker_top_n": 5,
+    "search_mode": "hybrid",
 }
 
 _reranker: CrossEncoder | None = None
 _bm25: BM25Retriever | None = None
+_pubmed_bm25: BM25Retriever | None = None
 _db = None  # cached Chroma instance — avoid reopening on every query
+_pubmed_db = None  # cached PubMed Chroma instance
 
 
 def _get_db():
@@ -45,6 +48,13 @@ def _get_reranker() -> CrossEncoder:
     return _reranker
 
 
+def _get_pubmed_db():
+    global _pubmed_db
+    if _pubmed_db is None:
+        _pubmed_db = load_pubmed_index()
+    return _pubmed_db
+
+
 def _get_bm25(k: int) -> BM25Retriever:
     """Build (once) and return a BM25 retriever over the full CMS index."""
     global _bm25
@@ -55,9 +65,24 @@ def _get_bm25(k: int) -> BM25Retriever:
             for text, meta in zip(result["documents"], result["metadatas"])
         ]
         _bm25 = BM25Retriever.from_documents(docs)
-        logger.info("BM25 index built over %d chunks", len(docs))
+        logger.info("BM25 index built over %d CMS chunks", len(docs))
     _bm25.k = k
     return _bm25
+
+
+def _get_pubmed_bm25(k: int) -> BM25Retriever:
+    """Build (once) and return a BM25 retriever over the full PubMed index."""
+    global _pubmed_bm25
+    if _pubmed_bm25 is None:
+        result = _get_pubmed_db().get(include=["documents", "metadatas"])
+        docs = [
+            Document(page_content=text, metadata=meta)
+            for text, meta in zip(result["documents"], result["metadatas"])
+        ]
+        _pubmed_bm25 = BM25Retriever.from_documents(docs)
+        logger.info("BM25 index built over %d PubMed abstracts", len(docs))
+    _pubmed_bm25.k = k
+    return _pubmed_bm25
 
 
 def _hybrid_retrieve(query: str, k: int) -> list[Document]:
@@ -70,6 +95,66 @@ def _hybrid_retrieve(query: str, k: int) -> list[Document]:
     bm25_docs = _get_bm25(k).invoke(query)
 
     # RRF constant k=60 is standard; higher = smoother rank blending
+    scores: dict[str, float] = {}
+    doc_map: dict[str, Document] = {}
+    for rank, doc in enumerate(dense_docs):
+        key = doc.page_content
+        scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank + 1)
+        doc_map[key] = doc
+    for rank, doc in enumerate(bm25_docs):
+        key = doc.page_content
+        scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank + 1)
+        doc_map[key] = doc
+
+    ranked = sorted(scores, key=lambda x: scores[x], reverse=True)
+    return [doc_map[k_] for k_ in ranked[:k]]
+
+
+def _hybrid_retrieve_ncd(query: str, k: int) -> list[Document]:
+    """Hybrid retrieve restricted to NCD chunks only (for gap analysis CMS side)."""
+    db = _get_db()
+    dense_docs = db.as_retriever(
+        search_type="similarity_score_threshold",
+        search_kwargs={
+            "k": k,
+            "score_threshold": PIPELINE_CONFIG["threshold"],
+            "filter": {"source": "NCD"},
+        },
+    ).invoke(query)
+    # BM25 has no native filter — post-filter after scoring
+    bm25_docs = [
+        d for d in _get_bm25(k).invoke(query)
+        if d.metadata.get("source") == "NCD"
+    ]
+
+    scores: dict[str, float] = {}
+    doc_map: dict[str, Document] = {}
+    for rank, doc in enumerate(dense_docs):
+        key = doc.page_content
+        scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank + 1)
+        doc_map[key] = doc
+    for rank, doc in enumerate(bm25_docs):
+        key = doc.page_content
+        scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank + 1)
+        doc_map[key] = doc
+
+    ranked = sorted(scores, key=lambda x: scores[x], reverse=True)
+    return [doc_map[k_] for k_ in ranked[:k]]
+
+
+def _hybrid_retrieve_pubmed(query: str, k: int) -> list[Document]:
+    """Fuse BM25 + dense vector results for the PubMed collection via RRF.
+
+    No cross-encoder reranking — bge-reranker-base is trained on web/passage pairs,
+    not clinical abstracts, and the raw hybrid candidates are sufficient quality.
+    """
+    db = _get_pubmed_db()
+    dense_docs = db.as_retriever(
+        search_type="similarity_score_threshold",
+        search_kwargs={"k": k, "score_threshold": PIPELINE_CONFIG["threshold"]},
+    ).invoke(query)
+    bm25_docs = _get_pubmed_bm25(k).invoke(query)
+
     scores: dict[str, float] = {}
     doc_map: dict[str, Document] = {}
     for rank, doc in enumerate(dense_docs):
@@ -276,24 +361,19 @@ def gap_analysis(
         pubmed_sources — PubMed abstract Documents used
     """
     k_ = k or PIPELINE_CONFIG["k"]
-    threshold = PIPELINE_CONFIG["threshold"]
 
     policy_docs: list[Document] = _rerank(
         question,
-        _hybrid_retrieve(question, k_),
+        _hybrid_retrieve_ncd(question, k_),
         top_n=PIPELINE_CONFIG["reranker_top_n"],
     )
 
     try:
-        pubmed_db = load_pubmed_index()
-        pubmed_docs: list[Document] = _rerank(
-            question,
-            pubmed_db.as_retriever(
-                search_type="similarity_score_threshold",
-                search_kwargs={"k": k_, "score_threshold": threshold},
-            ).invoke(question),
-            top_n=PIPELINE_CONFIG["reranker_top_n"],
-        )
+        # k=8 hybrid candidates used directly — no cross-encoder reranking.
+        # bge-reranker-base is trained on web passages, not clinical abstracts.
+        pubmed_docs: list[Document] = _hybrid_retrieve_pubmed(question, k=8)
+        # Sort newest-first so Gemini weights recent evidence more heavily.
+        pubmed_docs.sort(key=lambda d: d.metadata.get("year", "0"), reverse=True)
     except RuntimeError:
         logger.warning("PubMed index not found — run fetch_pubmed + pubmed_indexer first")
         pubmed_docs = []
