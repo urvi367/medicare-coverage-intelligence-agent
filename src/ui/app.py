@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,6 +18,50 @@ LOG_DIR = Path(__file__).parents[2] / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "interactions.jsonl"
 
+
+# ── Query router ──────────────────────────────────────────────────────────────
+
+# Signals that the user wants evidence vs policy comparison
+_GAP_SIGNALS = re.compile(
+    r"\b("
+    r"evidence|clinical\s+evidence|evidence.?base[d]?|"
+    r"research|study|studies|trial[s]?|clinical\s+trial[s]?|"
+    r"literature|systematic\s+review|meta.?analys[ie]s|"
+    r"rcts?|randomized|randomised|"
+    r"pubmed|published|peer.?reviewed|journal|"
+    r"finding[s]?|outcome[s]?|efficacy|effectiveness|"
+    r"gap|coverage\s+gap|"
+    r"compared?\s+to\s+(the\s+)?(evidence|research|literature|data)|"
+    r"what\s+does\s+(the\s+)?(evidence|research|literature|data)\s+(say|show|suggest|support)|"
+    r"is\s+there\s+(evidence|research|data)|"
+    r"data\s+support[s]?|clinical\s+data|"
+    r"does\s+(the\s+)?evidence|support[s]?\s+coverage"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Explicit policy signals (boost toward policy Q&A even if gap words appear)
+_POLICY_SIGNALS = re.compile(
+    r"\b("
+    r"cover(ed|age|s)?|criteria|requirement[s]?|eligible|eligib[il]+ity|"
+    r"medicare\s+(pay|reimburse|allow)|ncd|lcd|"
+    r"medically\s+necessary|medical\s+necessity|"
+    r"prior\s+auth|preauthori[sz]ation|"
+    r"billing|claim|reimburs"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _route(query: str) -> str:
+    """Return 'gap' or 'policy' based on query signals."""
+    gap_score = len(_GAP_SIGNALS.findall(query))
+    policy_score = len(_POLICY_SIGNALS.findall(query))
+    # Gap analysis only when evidence signals clearly dominate
+    return "gap" if gap_score > 0 and gap_score >= policy_score else "policy"
+
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 
 _FEEDBACK_LABELS = {
     "positive": "✅ Yes, this answered my question",
@@ -101,25 +146,11 @@ st.set_page_config(
     layout="wide",
 )
 
-# ── Sidebar mode selector ─────────────────────────────────────────────────────
-
-with st.sidebar:
-    st.header("Mode")
-    mode = st.radio(
-        "Select mode for your next question:",
-        ["Policy Q&A", "Evidence Gap Analysis"],
-        key="mode_selector",
-    )
-    st.divider()
-    if mode == "Policy Q&A":
-        st.caption("Answers coverage questions using CMS NCDs and LCDs.")
-    else:
-        st.caption("Compares CMS NCD coverage criteria against published PubMed clinical evidence.")
-
-# ── Main header ───────────────────────────────────────────────────────────────
-
 st.title("Medicare Coverage Intelligence Agent")
-st.caption("Ask coverage questions and evidence gap questions in any order — switch modes in the sidebar.")
+st.caption(
+    "Ask Medicare coverage questions or request evidence gap analysis — "
+    "routing is automatic based on your question."
+)
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
@@ -132,40 +163,33 @@ if "feedback" not in st.session_state:
 
 for i, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
-        if msg["role"] == "user":
-            st.markdown(msg["content"])
-            mode_tag = msg.get("mode")
-            if mode_tag:
-                label = "Policy Q&A" if mode_tag == "policy" else "Evidence Gap Analysis"
-                st.caption(f"Mode: {label}")
-        else:
-            st.markdown(msg["content"])
-            if msg.get("policy_sources"):
-                _render_sources(msg["policy_sources"], "CMS Policy Sources")
-            if msg.get("pubmed_sources"):
-                _render_sources(msg["pubmed_sources"], "PubMed Evidence")
-            if msg.get("sources"):
-                _render_sources(msg["sources"])
+        st.markdown(msg["content"])
+        if msg["role"] == "user" and msg.get("mode"):
+            tag = "Evidence Gap Analysis" if msg["mode"] == "gap" else "Policy Q&A"
+            st.caption(f"Routed to: {tag}")
+        if msg.get("policy_sources"):
+            _render_sources(msg["policy_sources"], "CMS Policy Sources")
+        if msg.get("pubmed_sources"):
+            _render_sources(msg["pubmed_sources"], "PubMed Evidence")
+        if msg.get("sources"):
+            _render_sources(msg["sources"])
+        if msg["role"] == "assistant":
             question = st.session_state.messages[i - 1]["content"] if i > 0 else ""
             _render_feedback(i, question)
 
 # ── Handle new input ──────────────────────────────────────────────────────────
 
-placeholder = (
-    "Ask a Medicare coverage question..."
-    if mode == "Policy Q&A"
-    else "Enter a clinical topic to compare CMS policy vs evidence..."
-)
+if prompt := st.chat_input("Ask a coverage question or request an evidence gap analysis..."):
+    mode = _route(prompt)
+    st.session_state.messages.append({"role": "user", "content": prompt, "mode": mode})
 
-if prompt := st.chat_input(placeholder):
-    mode_key = "policy" if mode == "Policy Q&A" else "gap"
-    st.session_state.messages.append({"role": "user", "content": prompt, "mode": mode_key})
     with st.chat_message("user"):
         st.markdown(prompt)
-        st.caption(f"Mode: {mode}")
+        tag = "Evidence Gap Analysis" if mode == "gap" else "Policy Q&A"
+        st.caption(f"Routed to: {tag}")
 
     with st.chat_message("assistant"):
-        if mode_key == "policy":
+        if mode == "policy":
             with st.spinner("Retrieving policy documents..."):
                 try:
                     result = answer(prompt)
