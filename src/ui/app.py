@@ -25,8 +25,7 @@ _FEEDBACK_LABELS = {
 }
 
 
-def _log_interaction(question: str, answer_text: str, sources: list, mode: str = "policy") -> None:
-    """Append one Q&A interaction to the JSONL log."""
+def _log_interaction(question: str, answer_text: str, sources: list, mode: str) -> None:
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "mode": mode,
@@ -46,7 +45,6 @@ def _log_interaction(question: str, answer_text: str, sources: list, mode: str =
 
 
 def _log_feedback(question: str, rating: str) -> None:
-    """Append a feedback event to the JSONL log."""
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "type": "feedback",
@@ -59,14 +57,11 @@ def _log_feedback(question: str, rating: str) -> None:
 
 
 def _render_feedback(msg_index: int, question: str) -> None:
-    """Render feedback buttons for an assistant message, or its recorded rating."""
     if "feedback" not in st.session_state:
         st.session_state.feedback = {}
-
     if msg_index in st.session_state.feedback:
         st.caption(f"Your feedback: {_FEEDBACK_LABELS[st.session_state.feedback[msg_index]]}")
         return
-
     cols = st.columns(3)
     for col, (key, label) in zip(cols, _FEEDBACK_LABELS.items()):
         if col.button(label, key=f"fb_{msg_index}_{key}"):
@@ -106,21 +101,25 @@ st.set_page_config(
     layout="wide",
 )
 
+# ── Sidebar mode selector ─────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.header("Mode")
+    mode = st.radio(
+        "Select mode for your next question:",
+        ["Policy Q&A", "Evidence Gap Analysis"],
+        key="mode_selector",
+    )
+    st.divider()
+    if mode == "Policy Q&A":
+        st.caption("Answers coverage questions using CMS NCDs and LCDs.")
+    else:
+        st.caption("Compares CMS NCD coverage criteria against published PubMed clinical evidence.")
+
+# ── Main header ───────────────────────────────────────────────────────────────
+
 st.title("Medicare Coverage Intelligence Agent")
-
-# ── Mode toggle ───────────────────────────────────────────────────────────────
-
-mode = st.radio(
-    "Mode",
-    ["Policy Q&A", "Evidence Gap Analysis"],
-    horizontal=True,
-    label_visibility="collapsed",
-)
-
-if mode == "Policy Q&A":
-    st.caption("Ask questions about Medicare NCDs and LCDs. Answers are grounded in official CMS policy documents.")
-else:
-    st.caption("Compare CMS NCD coverage positions against published PubMed clinical evidence. Identifies alignment, conflicts, and coverage gaps.")
+st.caption("Ask coverage questions and evidence gap questions in any order — switch modes in the sidebar.")
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
@@ -129,24 +128,24 @@ if "messages" not in st.session_state:
 if "feedback" not in st.session_state:
     st.session_state.feedback = {}
 
-# Clear history when switching modes
-if st.session_state.get("active_mode") != mode:
-    st.session_state.messages = []
-    st.session_state.feedback = {}
-    st.session_state.active_mode = mode
-
 # ── Render history ────────────────────────────────────────────────────────────
 
 for i, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        if msg.get("policy_sources"):
-            _render_sources(msg["policy_sources"], "CMS Policy Sources")
-        if msg.get("pubmed_sources"):
-            _render_sources(msg["pubmed_sources"], "PubMed Evidence")
-        if msg.get("sources"):
-            _render_sources(msg["sources"])
-        if msg["role"] == "assistant":
+        if msg["role"] == "user":
+            st.markdown(msg["content"])
+            mode_tag = msg.get("mode")
+            if mode_tag:
+                label = "Policy Q&A" if mode_tag == "policy" else "Evidence Gap Analysis"
+                st.caption(f"Mode: {label}")
+        else:
+            st.markdown(msg["content"])
+            if msg.get("policy_sources"):
+                _render_sources(msg["policy_sources"], "CMS Policy Sources")
+            if msg.get("pubmed_sources"):
+                _render_sources(msg["pubmed_sources"], "PubMed Evidence")
+            if msg.get("sources"):
+                _render_sources(msg["sources"])
             question = st.session_state.messages[i - 1]["content"] if i > 0 else ""
             _render_feedback(i, question)
 
@@ -155,16 +154,18 @@ for i, msg in enumerate(st.session_state.messages):
 placeholder = (
     "Ask a Medicare coverage question..."
     if mode == "Policy Q&A"
-    else "Enter a clinical topic to compare CMS policy vs evidence (e.g. 'home oxygen therapy')"
+    else "Enter a clinical topic to compare CMS policy vs evidence..."
 )
 
 if prompt := st.chat_input(placeholder):
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    mode_key = "policy" if mode == "Policy Q&A" else "gap"
+    st.session_state.messages.append({"role": "user", "content": prompt, "mode": mode_key})
     with st.chat_message("user"):
         st.markdown(prompt)
+        st.caption(f"Mode: {mode}")
 
     with st.chat_message("assistant"):
-        if mode == "Policy Q&A":
+        if mode_key == "policy":
             with st.spinner("Retrieving policy documents..."):
                 try:
                     result = answer(prompt)
@@ -205,4 +206,4 @@ if prompt := st.chat_input(placeholder):
                 "policy_sources": policy_sources,
                 "pubmed_sources": pubmed_sources,
             })
-            _log_interaction(prompt, result["gap_report"], result["policy_sources"], mode="gap_analysis")
+            _log_interaction(prompt, result["gap_report"], result["policy_sources"], mode="gap")
