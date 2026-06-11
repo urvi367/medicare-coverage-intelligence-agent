@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 
 GOLDEN_GAP_PATH = Path(__file__).parents[2] / "data" / "golden_gap.json"
 NCD_PATH = Path(__file__).parents[2] / "data" / "ncd_raw.json"
+# Questions cache (keyed by NCD number) — decoupled from labeling so an interrupted
+# run never re-calls Groq for a question it already generated (protects free-tier quota).
+QUESTIONS_PATH = Path(__file__).parents[2] / "data" / "gap_questions.json"
+
+_GROQ_DELAY = 2.0  # free tier ~30 RPM → 2s gap keeps well under the limit
 
 _GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 _GROQ_MODEL = "llama-3.1-8b-instant"
@@ -85,8 +90,11 @@ PUBMED ABSTRACTS:
 {abstracts}"""
 
 
-def _groq_question(title: str) -> str:
-    """Generate an evidence-seeking question for an NCD topic via Groq."""
+def _groq_question(title: str, retries: int = 6) -> str:
+    """Generate an evidence-seeking question for an NCD topic via Groq.
+
+    Retries on 429 using the Retry-After header (Groq free tier rate limit).
+    """
     api_key = os.environ.get("GROQ_API_KEY", "")
     if not api_key:
         raise RuntimeError("GROQ_API_KEY not set.")
@@ -97,9 +105,22 @@ def _groq_question(title: str) -> str:
         "temperature": 0.7,
         "max_tokens": 100,
     }
-    r = requests.post(_GROQ_URL, headers=headers, json=body, timeout=30)
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"].strip()
+    for attempt in range(retries):
+        r = requests.post(_GROQ_URL, headers=headers, json=body, timeout=30)
+        if r.status_code == 429:
+            wait = float(r.headers.get("retry-after", min(2 ** attempt, 60))) + 1
+            logger.warning("Groq rate limited (attempt %d/%d) — waiting %.0fs", attempt + 1, retries, wait)
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    raise RuntimeError(f"Groq still rate-limited after {retries} retries (daily quota may be exhausted).")
+
+
+def _load_questions_cache() -> dict[str, str]:
+    if QUESTIONS_PATH.exists():
+        return json.loads(QUESTIONS_PATH.read_text(encoding="utf-8"))
+    return {}
 
 
 def _abstracts_for_ncd(pubmed_db, ncd_number: str, limit: int = 12) -> list[dict]:
@@ -204,6 +225,10 @@ def generate(max_ncds: int | None = None) -> list[dict]:
         existing = json.loads(GOLDEN_GAP_PATH.read_text(encoding="utf-8"))
         logger.info("Resuming — %d records already generated", len(existing))
 
+    questions = _load_questions_cache()
+    if questions:
+        logger.info("Loaded %d cached questions", len(questions))
+
     done_ncds = {r["expected_ncd"] for r in existing}
 
     for i, ncd in enumerate(ncds, 1):
@@ -219,12 +244,17 @@ def generate(max_ncds: int | None = None) -> list[dict]:
             logger.info("    No abstracts for %s — skipping (no evidence to judge)", policy_number)
             continue
 
-        try:
-            question = _groq_question(ncd["title"])
-        except Exception as e:
-            logger.warning("Groq failed for %s: %s — skipping", ncd["title"][:40], e)
-            continue
-        time.sleep(0.4)  # Groq free tier headroom
+        if policy_number in questions:
+            question = questions[policy_number]
+        else:
+            try:
+                question = _groq_question(ncd["title"])
+            except Exception as e:
+                logger.warning("Groq failed for %s: %s — skipping", ncd["title"][:40], e)
+                continue
+            questions[policy_number] = question
+            QUESTIONS_PATH.write_text(json.dumps(questions, indent=2), encoding="utf-8")
+            time.sleep(_GROQ_DELAY)  # Groq free-tier rate-limit headroom
 
         try:
             label = _judge_alignment(policy_number, ncd["title"], ncd["text"], abstracts)
