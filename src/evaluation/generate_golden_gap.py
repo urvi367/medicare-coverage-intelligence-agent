@@ -76,26 +76,36 @@ coverage policy aligns with the published clinical evidence for ONE topic.
 Read the CMS policy text and the PubMed abstracts below, then decide the alignment \
 using EXACTLY one of these labels:
 - Aligned — CMS coverage matches what the evidence supports
-- Partially Aligned — same overall direction, but scope/criteria mismatch (e.g. CMS \
-covers a narrower population, stricter thresholds, or fewer indications than the \
-evidence supports)
+- Partially Aligned — the abstracts directly study the SAME intervention for the SAME \
+condition CMS addresses, agree it works, but differ on scope (narrower/broader \
+population, stricter thresholds, severity). Scope mismatch ONLY — not evidence about \
+a different condition or indication.
 - Conflicting — opposite directions: CMS covers what the evidence says does not work, \
 or CMS's stated rationale contradicts the evidence
 - Coverage Gap — evidence supports the intervention but CMS explicitly does not cover \
 it (a non-coverage position, not mere narrowness)
 - Inverse Gap — CMS covers it but the retrieved evidence is weak, absent, or negative
-- Insufficient Evidence — fewer than 2 abstracts actually address this intervention's \
-clinical outcomes (off-topic or methods-only abstracts do not count)
+- Insufficient Evidence — fewer than 2 abstracts actually report clinical outcomes for \
+THIS intervention applied to THIS condition. Abstracts about a different indication, a \
+different population, methodology only, or background/history do NOT count as relevant \
+evidence even if they are real studies.
+
+FIRST, before any other label, apply this gate:
+  Count the abstracts that directly report clinical outcomes of THIS intervention for \
+THIS condition. If fewer than 2 → ALIGNMENT: Insufficient Evidence. Do NOT rescue \
+off-topic abstracts by inventing a scope or "fewer indications" argument — evidence for \
+a different condition is not evidence that CMS coverage is too narrow.
 
 Decision rules for the confusable boundaries:
+- Partially Aligned vs Insufficient Evidence: Partially Aligned requires on-topic \
+evidence about the same intervention+condition. If the abstracts are about a different \
+indication/population, that is Insufficient Evidence, not Partially Aligned.
 - Partially Aligned vs Conflicting: if CMS and the evidence agree the intervention \
 works but disagree on WHO/WHEN it is appropriate, that is Partially Aligned. \
 Conflicting requires opposite conclusions about whether it works at all.
 - Coverage Gap vs Conflicting: Coverage Gap requires an explicit CMS non-coverage \
 position on something the evidence supports. If CMS covers it (even restrictively), \
 it is never a Coverage Gap.
-- Insufficient Evidence is about the ABSTRACTS' quantity/relevance, not the quality \
-of CMS's policy. Apply it before any other label.
 
 Calibration examples (illustrative only — cite ONLY PMIDs from the abstracts below):
 
@@ -123,6 +133,14 @@ outcomes.
 ALIGNMENT: Insufficient Evidence
 RATIONALE: Fewer than 2 abstracts address clinical outcomes for this intervention, \
 so alignment cannot be judged.
+
+Example 5 — CMS covers acupuncture for chronic low-back pain; the retrieved abstracts \
+are real RCTs, but they study acupuncture for post-stroke fatigue and fibromyalgia, \
+not low-back pain.
+ALIGNMENT: Insufficient Evidence
+RATIONALE: The abstracts study the same intervention for DIFFERENT conditions, so they \
+do not bear on CMS's low-back-pain coverage — this is not a "fewer indications" scope \
+mismatch.
 
 Reason ONLY from the documents provided. Do not use outside knowledge of newer policy.
 
