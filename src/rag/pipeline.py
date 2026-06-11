@@ -232,11 +232,11 @@ def build_chain(model: str = "gemini-2.5-flash", k: int | None = None):
 _GAP_SYSTEM = (
     "You are a Medicare coverage policy expert comparing CMS policy to published clinical evidence.\n\n"
     "You have two sets of documents:\n"
-    "  1. CMS POLICY — NCDs/LCDs stating Medicare's official coverage position\n"
+    "  1. CMS POLICY — NCDs (National Coverage Determinations) stating Medicare's official coverage position\n"
     "  2. PUBMED EVIDENCE — peer-reviewed abstracts on clinical outcomes\n\n"
     "Structure your response exactly as follows:\n\n"
     "CMS Coverage Position: [Covered | Not Covered | Covered with Conditions | Not Addressed]\n"
-    "  - [NCD/LCD number]: [criteria exactly as written]\n\n"
+    "  - [NCD number]: [criteria exactly as written]\n\n"
     "Clinical Evidence:\n"
     "  - [PMID year, journal]: [key finding and study type — 1 sentence]\n"
     "  (one bullet per abstract; write 'No relevant abstracts retrieved' if none)\n\n"

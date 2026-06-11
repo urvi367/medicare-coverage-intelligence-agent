@@ -8,7 +8,7 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 
-from src.rag.pipeline import answer
+from src.rag.pipeline import answer, gap_analysis
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -25,10 +25,11 @@ _FEEDBACK_LABELS = {
 }
 
 
-def _log_interaction(question: str, answer_text: str, sources: list) -> None:
+def _log_interaction(question: str, answer_text: str, sources: list, mode: str = "policy") -> None:
     """Append one Q&A interaction to the JSONL log."""
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
+        "mode": mode,
         "question": question,
         "answer": answer_text,
         "sources": [
@@ -74,18 +75,30 @@ def _render_feedback(msg_index: int, question: str) -> None:
             st.rerun()
 
 
-def _render_sources(sources: list[dict]) -> None:
+def _render_sources(sources: list[dict], label: str = "Sources") -> None:
     if not sources:
         return
-    with st.expander("Sources"):
+    with st.expander(label):
         for s in sources:
-            label = s.get("title") or s.get("policy_number") or "Unknown"
-            st.markdown(f"**{label}** `{s.get('source','')} {s.get('policy_number','')}`")
+            title = s.get("title") or s.get("policy_number") or "Unknown"
+            st.markdown(f"**{title}** `{s.get('source','')} {s.get('policy_number','')}`")
             if excerpt := s.get("excerpt"):
                 st.caption(excerpt)
 
 
-# ── Page config ──────────────────────────────────────────────────────────────
+def _source_meta(docs) -> list[dict]:
+    return [
+        {
+            "title": s.metadata.get("title", ""),
+            "policy_number": s.metadata.get("policy_number", ""),
+            "source": s.metadata.get("source", ""),
+            "excerpt": s.page_content,
+        }
+        for s in docs
+    ]
+
+
+# ── Page config ───────────────────────────────────────────────────────────────
 
 st.set_page_config(
     page_title="Medicare Coverage Agent",
@@ -94,10 +107,20 @@ st.set_page_config(
 )
 
 st.title("Medicare Coverage Intelligence Agent")
-st.caption(
-    "Ask questions about Medicare NCDs and LCDs. "
-    "Answers are grounded in official CMS policy documents."
+
+# ── Mode toggle ───────────────────────────────────────────────────────────────
+
+mode = st.radio(
+    "Mode",
+    ["Policy Q&A", "Evidence Gap Analysis"],
+    horizontal=True,
+    label_visibility="collapsed",
 )
+
+if mode == "Policy Q&A":
+    st.caption("Ask questions about Medicare NCDs and LCDs. Answers are grounded in official CMS policy documents.")
+else:
+    st.caption("Compare CMS NCD coverage positions against published PubMed clinical evidence. Identifies alignment, conflicts, and coverage gaps.")
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
@@ -106,49 +129,80 @@ if "messages" not in st.session_state:
 if "feedback" not in st.session_state:
     st.session_state.feedback = {}
 
+# Clear history when switching modes
+if st.session_state.get("active_mode") != mode:
+    st.session_state.messages = []
+    st.session_state.feedback = {}
+    st.session_state.active_mode = mode
+
 # ── Render history ────────────────────────────────────────────────────────────
 
 for i, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
+        if msg.get("policy_sources"):
+            _render_sources(msg["policy_sources"], "CMS Policy Sources")
+        if msg.get("pubmed_sources"):
+            _render_sources(msg["pubmed_sources"], "PubMed Evidence")
         if msg.get("sources"):
             _render_sources(msg["sources"])
         if msg["role"] == "assistant":
-            # question is the preceding user message
             question = st.session_state.messages[i - 1]["content"] if i > 0 else ""
             _render_feedback(i, question)
 
 # ── Handle new input ──────────────────────────────────────────────────────────
 
-if prompt := st.chat_input("Ask a Medicare coverage question..."):
+placeholder = (
+    "Ask a Medicare coverage question..."
+    if mode == "Policy Q&A"
+    else "Enter a clinical topic to compare CMS policy vs evidence (e.g. 'home oxygen therapy')"
+)
+
+if prompt := st.chat_input(placeholder):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Retrieving policy documents..."):
-            try:
-                result = answer(prompt)
-            except RuntimeError as e:
-                st.error(str(e))
-                st.stop()
+        if mode == "Policy Q&A":
+            with st.spinner("Retrieving policy documents..."):
+                try:
+                    result = answer(prompt)
+                except RuntimeError as e:
+                    st.error(str(e))
+                    st.stop()
 
-        st.markdown(result["answer"])
+            st.markdown(result["answer"])
+            sources = _source_meta(result["sources"])
+            _render_sources(sources)
+            new_index = len(st.session_state.messages)
+            _render_feedback(new_index, prompt)
 
-        source_meta = [
-            {
-                "title": s.metadata.get("title", ""),
-                "policy_number": s.metadata.get("policy_number", ""),
-                "source": s.metadata.get("source", ""),
-                "excerpt": s.page_content,
-            }
-            for s in result["sources"]
-        ]
-        _render_sources(source_meta)
-        new_index = len(st.session_state.messages)  # user already appended; assistant will be at this index
-        _render_feedback(new_index, prompt)
+            st.session_state.messages.append(
+                {"role": "assistant", "content": result["answer"], "sources": sources}
+            )
+            _log_interaction(prompt, result["answer"], result["sources"], mode="policy")
 
-    st.session_state.messages.append(
-        {"role": "assistant", "content": result["answer"], "sources": source_meta}
-    )
-    _log_interaction(prompt, result["answer"], result["sources"])
+        else:
+            with st.spinner("Retrieving CMS policy and PubMed evidence..."):
+                try:
+                    result = gap_analysis(prompt)
+                except RuntimeError as e:
+                    st.error(str(e))
+                    st.stop()
+
+            st.markdown(result["gap_report"])
+            policy_sources = _source_meta(result["policy_sources"])
+            pubmed_sources = _source_meta(result["pubmed_sources"])
+            _render_sources(policy_sources, "CMS Policy Sources")
+            _render_sources(pubmed_sources, "PubMed Evidence")
+            new_index = len(st.session_state.messages)
+            _render_feedback(new_index, prompt)
+
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": result["gap_report"],
+                "policy_sources": policy_sources,
+                "pubmed_sources": pubmed_sources,
+            })
+            _log_interaction(prompt, result["gap_report"], result["policy_sources"], mode="gap_analysis")
