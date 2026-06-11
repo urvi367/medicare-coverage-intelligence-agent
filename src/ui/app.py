@@ -154,6 +154,8 @@ def _render_sources(sources: list[dict], label: str = "Sources") -> None:
                 meta = f"PMID {s['pmid']}"
                 if s.get("year"):
                     meta += f" · {s['year']}"
+                if s.get("study_type"):
+                    meta += f" · {s['study_type']}"
                 if s.get("journal"):
                     meta += f" · {s['journal']}"
                 st.markdown(f"**{title}** `{meta}`")
@@ -183,6 +185,7 @@ def _pubmed_source_meta(docs) -> list[dict]:
             "pmid": s.metadata.get("pmid", ""),
             "year": s.metadata.get("year", ""),
             "journal": s.metadata.get("journal", ""),
+            "study_type": s.metadata.get("study_type", ""),
             "excerpt": s.page_content,
         }
         for s in docs

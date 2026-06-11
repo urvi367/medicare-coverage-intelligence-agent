@@ -182,6 +182,7 @@ def _abstracts_for_ncd(pubmed_db, ncd_number: str, limit: int = 12) -> list[dict
             "pmid": meta.get("pmid", ""),
             "year": meta.get("year", ""),
             "journal": meta.get("journal", ""),
+            "study_type": meta.get("study_type", ""),
             "text": text,
         })
     return out[:limit]
@@ -192,7 +193,8 @@ def _format_abstracts(abstracts: list[dict]) -> str:
         return "No abstracts retrieved for this topic."
     parts = []
     for a in abstracts:
-        header = f"PMID {a['pmid']} ({a.get('year') or '?'}, {a.get('journal') or '?'})"
+        stype = a.get("study_type") or "study type unspecified"
+        header = f"PMID {a['pmid']} ({a.get('year') or '?'}, {stype}, {a.get('journal') or '?'})"
         parts.append(f"{header}\n{a['text'][:_MAX_ABSTRACT_CHARS]}")
     return "\n\n---\n\n".join(parts)
 

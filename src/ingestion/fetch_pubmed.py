@@ -59,6 +59,39 @@ def _extract_year(article: ElementTree.Element) -> str:
     return ""
 
 
+# PubMed PublicationType values, strongest study design first. NLM tags every record
+# with these; we keep the highest-ranked one as the study type for Evidence Grade.
+_EVIDENCE_HIERARCHY = [
+    "Meta-Analysis",
+    "Systematic Review",
+    "Randomized Controlled Trial",
+    "Controlled Clinical Trial",
+    "Clinical Trial",
+    "Multicenter Study",
+    "Comparative Study",
+    "Observational Study",
+    "Case Reports",
+    "Practice Guideline",
+    "Guideline",
+    "Review",
+]
+_GENERIC_PUB_TYPES = {"Journal Article", "English Abstract", "Research Support, Non-U.S. Gov't",
+                      "Research Support, U.S. Gov't, Non-P.H.S.", "Published Erratum"}
+
+
+def _extract_study_type(article: ElementTree.Element) -> str:
+    """Return the strongest study design from an article's PublicationType tags.
+
+    Falls back to any non-generic type, else "" (e.g. a plain Journal Article).
+    """
+    types = {el.text for el in article.findall(".//PublicationType") if el.text}
+    for t in _EVIDENCE_HIERARCHY:
+        if t in types:
+            return t
+    meaningful = types - _GENERIC_PUB_TYPES
+    return sorted(meaningful)[0] if meaningful else ""
+
+
 def _fetch_abstracts(pmids: list[str]) -> list[dict[str, Any]]:
     """Fetch PubMed XML for a list of PMIDs and parse into dicts."""
     if not pmids:
@@ -102,6 +135,7 @@ def _fetch_abstracts(pmids: list[str]) -> list[dict[str, Any]]:
                 "abstract": abstract,
                 "year": year,
                 "journal": journal,
+                "study_type": _extract_study_type(article),
             })
     return records
 
@@ -155,8 +189,8 @@ def fetch_and_save(max_per_topic: int = 10) -> Path:
     return out
 
 
-def _fetch_years(pmids: list[str]) -> dict[str, str]:
-    """Efetch a batch of PMIDs and return {pmid: year} for those with a parseable year."""
+def _fetch_fields(pmids: list[str]) -> dict[str, dict[str, str]]:
+    """Efetch a batch of PMIDs and return {pmid: {year, study_type}} for each."""
     if not pmids:
         return {}
     params = {"db": "pubmed", "id": ",".join(pmids), "rettype": "abstract"}
@@ -165,46 +199,49 @@ def _fetch_years(pmids: list[str]) -> dict[str, str]:
         r.raise_for_status()
         root = ElementTree.fromstring(r.content)
     except Exception as e:
-        logger.warning("efetch (years) failed for %d pmids: %s", len(pmids), e)
+        logger.warning("efetch (fields) failed for %d pmids: %s", len(pmids), e)
         return {}
-    years: dict[str, str] = {}
+    out: dict[str, dict[str, str]] = {}
     for article in root.findall(".//PubmedArticle"):
         pmid_el = article.find(".//PMID")
         pmid = pmid_el.text if pmid_el is not None else ""
-        year = _extract_year(article)
-        if pmid and year:
-            years[pmid] = year
-    return years
+        if pmid:
+            out[pmid] = {"year": _extract_year(article), "study_type": _extract_study_type(article)}
+    return out
 
 
-def backfill_years(batch_size: int = 200) -> Path:
-    """Backfill missing years onto existing pubmed_raw.json records (no re-search).
+def backfill_metadata(batch_size: int = 200) -> Path:
+    """Backfill missing year + study_type onto existing pubmed_raw.json (no re-search).
 
-    Re-fetches only the dates for PMIDs already saved, preserving the exact dataset.
+    Re-fetches only metadata for PMIDs already saved, preserving the exact dataset.
     Run `python -m src.rag.pubmed_indexer` afterward to rebuild the index.
     """
     path = DATA_DIR / "pubmed_raw.json"
     records = json.loads(path.read_text(encoding="utf-8"))
     pmids = [r["pmid"] for r in records if r.get("pmid")]
-    logger.info("Backfilling years for %d PMIDs in batches of %d...", len(pmids), batch_size)
+    logger.info("Backfilling year + study_type for %d PMIDs in batches of %d...", len(pmids), batch_size)
 
-    year_map: dict[str, str] = {}
+    field_map: dict[str, dict[str, str]] = {}
     for i in range(0, len(pmids), batch_size):
         batch = pmids[i:i + batch_size]
         time.sleep(_DELAY)
-        year_map.update(_fetch_years(batch))
-        logger.info("  [%d/%d] resolved %d years so far", min(i + batch_size, len(pmids)), len(pmids), len(year_map))
+        field_map.update(_fetch_fields(batch))
+        logger.info("  [%d/%d] resolved %d records so far", min(i + batch_size, len(pmids)), len(pmids), len(field_map))
 
-    filled = 0
+    filled_year = filled_type = 0
     for r in records:
-        y = year_map.get(r.get("pmid", ""))
-        if y and not r.get("year"):
-            r["year"] = y
-            filled += 1
+        m = field_map.get(r.get("pmid", ""), {})
+        if m.get("year") and not r.get("year"):
+            r["year"] = m["year"]
+            filled_year += 1
+        if m.get("study_type") and not r.get("study_type"):
+            r["study_type"] = m["study_type"]
+            filled_type += 1
 
     path.write_text(json.dumps(records, indent=2), encoding="utf-8")
-    still_empty = sum(1 for r in records if not r.get("year"))
-    logger.info("Filled %d years; %d still empty. Saved %s", filled, still_empty, path)
+    typed = sum(1 for r in records if r.get("study_type"))
+    logger.info("Filled %d years, %d study_types. %d/%d records now have a study_type. Saved %s",
+                filled_year, filled_type, typed, len(records), path)
     return path
 
 
@@ -224,6 +261,7 @@ def load_documents() -> list[dict[str, str]]:
             "title": r["title"],
             "year": r["year"],
             "journal": r["journal"],
+            "study_type": r.get("study_type", ""),
             "source_ncd_title": r.get("source_ncd_title", ""),
             "source_ncd_number": r.get("source_ncd_number", ""),
         })
@@ -231,5 +269,9 @@ def load_documents() -> list[dict[str, str]]:
 
 
 if __name__ == "__main__":
+    import sys
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    fetch_and_save()
+    if "--backfill" in sys.argv:
+        backfill_metadata()  # patch year + study_type onto existing data, no re-search
+    else:
+        fetch_and_save()

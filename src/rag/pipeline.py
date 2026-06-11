@@ -301,7 +301,11 @@ _GAP_SYSTEM = (
     "  ALWAYS begin each bullet with the literal token 'PMID' followed by the numeric\n"
     "  PubMed ID exactly as it appears in the abstracts (e.g. 'PMID 12811203').\n"
     "  (one bullet per abstract; write 'No relevant abstracts retrieved' if none)\n\n"
-    "Evidence Grade: [Strong — RCT or meta-analysis | Moderate — cohort or observational | Weak / Insufficient]\n\n"
+    "Evidence Grade: [Strong — RCT or meta-analysis/systematic review | Moderate — cohort or observational | Weak / Insufficient]\n"
+    "  Base the grade on the study type shown in each abstract's header (the NLM-assigned\n"
+    "  PublicationType, e.g. 'Meta-Analysis', 'Randomized Controlled Trial', 'Review'), not\n"
+    "  on your own guess from the prose. 'study type unspecified' = treat as Weak unless the\n"
+    "  abstract text clearly describes a stronger design.\n\n"
     "Alignment: [Aligned | Partially Aligned | Conflicting | "
     "Coverage Gap — evidence supports but CMS does not cover | "
     "Inverse Gap — CMS covers but clinical evidence is weak | "
@@ -326,7 +330,8 @@ def _format_pubmed_docs(docs: list[Document]) -> str:
     parts = []
     for i, d in enumerate(docs, 1):
         m = d.metadata
-        header = f"[{i}] PMID {m.get('pmid', '?')} ({m.get('year', '?')}) — {m.get('journal', '?')}"
+        stype = m.get("study_type") or "study type unspecified"
+        header = f"[{i}] PMID {m.get('pmid', '?')} ({m.get('year', '?')}, {stype}) — {m.get('journal', '?')}"
         parts.append(f"{header}\n{d.page_content}")
     return "\n\n---\n\n".join(parts)
 
