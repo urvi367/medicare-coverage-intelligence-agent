@@ -12,3 +12,4 @@ agent/
 # data — commit index + raw CMS data, ignore eval/pubmed artifacts
 data/pubmed_raw.json
 data/golden_dataset.json
+data/golden_gap.json
