@@ -23,12 +23,18 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 GOLDEN_GAP_PATH = Path(__file__).parents[2] / "data" / "golden_gap.json"
-NCD_PATH = Path(__file__).parents[2] / "data" / "ncd_raw.json"
 # Questions cache (keyed by NCD number) — decoupled from labeling so an interrupted
 # run never re-calls Groq for a question it already generated (protects free-tier quota).
 QUESTIONS_PATH = Path(__file__).parents[2] / "data" / "gap_questions.json"
 
 _GROQ_DELAY = 2.0  # free tier ~30 RPM → 2s gap keeps well under the limit
+
+# Truncation caps for the labeler context. Set generously — flash-lite has a huge
+# context window, so the cost of full text is negligible and avoids cutting the
+# coverage decision (NCD: indications_limitations is appended last) or an abstract's
+# conclusion (p90 abstract ~2465 chars; the old 600 cap cut 97% of abstracts).
+_MAX_NCD_CHARS = 8000
+_MAX_ABSTRACT_CHARS = 2500
 
 _GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 _GROQ_MODEL = "llama-3.1-8b-instant"
@@ -187,7 +193,7 @@ def _format_abstracts(abstracts: list[dict]) -> str:
     parts = []
     for a in abstracts:
         header = f"PMID {a['pmid']} ({a.get('year') or '?'}, {a.get('journal') or '?'})"
-        parts.append(f"{header}\n{a['text'][:600]}")
+        parts.append(f"{header}\n{a['text'][:_MAX_ABSTRACT_CHARS]}")
     return "\n\n---\n\n".join(parts)
 
 
@@ -233,7 +239,7 @@ def _judge_alignment(ncd_number: str, ncd_title: str, ncd_text: str, abstracts: 
     prompt = _LABEL_PROMPT.format(
         ncd_number=ncd_number,
         ncd_title=ncd_title,
-        ncd_text=ncd_text[:3000],
+        ncd_text=ncd_text[:_MAX_NCD_CHARS],
         abstracts=_format_abstracts(abstracts),
     )
     for attempt in range(8):
@@ -266,10 +272,13 @@ def generate(max_ncds: int | None = None) -> list[dict]:
     Returns:
         List of golden gap records.
     """
+    from src.ingestion.fetch import load_documents
     from src.rag.pubmed_indexer import load_pubmed_index
 
-    ncd_records = json.loads(NCD_PATH.read_text(encoding="utf-8"))
-    ncds = [r for r in ncd_records if r.get("title") and r.get("text")]
+    # load_documents assembles + HTML-cleans the decision-bearing NCD fields
+    # (item_service_description + indications_limitations) into "text" — the same
+    # content the index is built from. ncd_raw.json has no top-level "text" field.
+    ncds = load_documents("ncd")
     if max_ncds:
         ncds = ncds[:max_ncds]
 
@@ -287,7 +296,7 @@ def generate(max_ncds: int | None = None) -> list[dict]:
     done_ncds = {r["expected_ncd"] for r in existing}
 
     for i, ncd in enumerate(ncds, 1):
-        policy_number = ncd.get("document_display_id", "")
+        policy_number = ncd["policy_number"]
         if policy_number in done_ncds:
             logger.info("  Skipping [%d/%d] (done): %s", i, len(ncds), ncd["title"][:60])
             continue
