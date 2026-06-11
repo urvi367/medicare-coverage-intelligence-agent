@@ -19,7 +19,8 @@
 | v1.6 | 2026-06-09 | Fix `_strip_html` bug (HTML entities unescaped after tag-strip, leaving `<p>` noise in all chunks). Add title prepend + synonym expansion (50+ clinical↔CMS term pairs) to every chunk at index time. Context Precision target met (0.832). |
 | v1.7 | 2026-06-10 | Widen retrieval to k=10 / threshold=0.65 (reranker now selects 5-of-10, not just reorders). Dynamic answer cache path derived from PIPELINE_CONFIG — each config gets its own file, no stale reuse. Add JUDGE_MODEL + PROMPT_TAG constants to judge.py; upgrade judge to gemini-2.5-flash. Add policy_recall metric. |
 | v1.8 | 2026-06-10 | Fix root cause of persistent HTML entities: CMS data is double-escaped (`&amp;gt;` → `&gt;` after one pass). `_strip_html` now unescapes to fixed point. Fix tag regex to spare clinical comparisons (`< 80 mm Hg`). Fix `build_index` silently appending on rebuild (Chroma assigns fresh IDs — index was 8473 chunks / 4× duplication). Add `shutil.rmtree` wipe before rebuild. Fix LCD jurisdiction addendum firing on stray LCD chunks ranked 2nd–5th — now only fires when top-ranked doc is an LCD. First clean baseline established. |
-| v1.9 | 2026-06-10 | Phase 2 scaffold: `src/ingestion/fetch_pubmed.py` (NCBI E-utilities, per-NCD topic search, dedup by PMID) + `src/rag/pubmed_indexer.py` (separate `pubmed_evidence` Chroma collection, safe rebuild). |
+| v1.9 | 2026-06-10 | Phase 2 scaffold: `src/ingestion/fetch_pubmed.py` (NCBI E-utilities, per-NCD topic search, dedup by PMID) + `src/rag/pubmed_indexer.py` (separate `pubmed_evidence` Chroma collection, safe rebuild). Moved to `phase-2` branch. |
+| v2.0 | 2026-06-10 | Hybrid BM25 + dense retrieval with Reciprocal Rank Fusion (RRF k=60). BM25 fixes numeric threshold retrieval failures (e.g. "55 mmHg"). `search_mode` field added to PIPELINE_CONFIG; cache path now includes mode suffix. Chroma DB object cached in `_get_db()` — no longer reopened per query. Blank chunk filter added to `build_index()`. UI: feedback buttons (positive/partial/negative), full chunk text in sources expander. Deployed to Streamlit Community Cloud (`main` branch). |
 
 ---
 
@@ -80,8 +81,8 @@ Phase 1 uses RAG + prompt engineering — no agent loop. Coverage policy lookup 
 |---|---|---|
 | 1. Input validation | Rule-based filter | Block PHI. Flag member-specific queries. |
 | 2. Query embedding | `BAAI/bge-small-en-v1.5` (local CPU) | Same model used at index and query time. Zero API cost. |
-| 3. Vector search | ChromaDB at `data/chroma/` | k=10, cosine similarity threshold=0.65. 800-char chunks / 100-char overlap. |
-| 4. Cross-encoder reranking | `BAAI/bge-reranker-base` (local CPU) | Scores each (query, chunk) pair jointly. Selects top 5 of k=10 — real filtering, not just reordering. |
+| 3. Hybrid retrieval | BM25 + ChromaDB + RRF | BM25 sparse (k=10) + dense vector search (k=10, threshold=0.65) fused via Reciprocal Rank Fusion (k=60). BM25 handles exact term/numeric matches; dense handles semantic similarity. Up to 20 merged candidates passed to reranker. |
+| 4. Cross-encoder reranking | `BAAI/bge-reranker-base` (local CPU) | Scores each (query, chunk) pair jointly. Selects top 5 of merged candidates — real filtering, not just reordering. |
 | 5. Context injection | Prompt template | Top-5 reranked chunks with NCD/LCD headers. LCD jurisdiction note injected only when the top-ranked doc is an LCD. |
 | 6. Answer generation | `gemini-2.5-flash` — temperature=0 | Indefinite retry loop reads `retryDelay` from API error. Returns answer + source Documents. |
 | 7. RAGAS evaluation | `gemini-2.5-flash` + `BAAI/bge-small-en-v1.5` | Faithfulness, AnswerRelevancy (bypass_n=True), LLMContextPrecisionWithoutReference, policy_recall, citation_accuracy. Per-sample scores → `logs/eval_samples_latest.json`. Cache path derived from PIPELINE_CONFIG — each config gets its own file. |
@@ -266,4 +267,4 @@ Medical policy teams currently pay $200K–500K per engagement for periodic manu
 
 ---
 
-*Medicare Coverage Intelligence Platform · PRD v1.5 · All data sources public · Last updated 2026-06-09*
+*Medicare Coverage Intelligence Platform · PRD v2.0 · All data sources public · Last updated 2026-06-10*
