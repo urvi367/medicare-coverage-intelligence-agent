@@ -29,7 +29,9 @@ _GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 _GROQ_MODEL = "llama-3.1-8b-instant"
 
 # Independent labeler. Reads raw NCD + abstracts; never sees the pipeline's report.
-LABEL_MODEL = "gemini-2.5-flash"
+# flash-lite: cheaper, and a different tier from the pipeline's flash generator —
+# marginally stronger independence for the reference labels.
+LABEL_MODEL = "gemini-2.5-flash-lite"
 
 # Alignment rubric — MUST match the labels the pipeline emits (_GAP_SYSTEM) so the
 # pipeline's output can be compared against the reference.
