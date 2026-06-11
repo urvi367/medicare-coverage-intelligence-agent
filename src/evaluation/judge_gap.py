@@ -1,12 +1,14 @@
 """Evaluate gap_analysis() against the golden gap dataset.
 
 Metrics:
-  alignment_accuracy — canonical-label match vs the independent reference alignment
-  ncd_recall         — expected NCD surfaced by RETRIEVAL (in policy_sources metadata),
-                       not merely echoed in the report — tests retrieval, not parroting
-  pmid_recall        — fraction of reference PMIDs cited (when reference_pmids available)
-  citation_precision — fraction of cited PMIDs that were actually retrieved
-  faithfulness       — RAGAS faithfulness of gap report vs policy + pubmed contexts
+  alignment_accuracy   — END-TO-END: reached the reference alignment AND retrieved the
+                         right NCD to reason from (a match on the wrong policy = miss)
+  alignment_label_match— diagnostic: raw label agreement vs reference, ignoring retrieval
+  ncd_recall           — expected NCD surfaced by RETRIEVAL (in policy_sources metadata),
+                         not merely echoed in the report — tests retrieval, not parroting
+  pmid_recall          — fraction of reference PMIDs cited (when reference_pmids available)
+  citation_precision   — fraction of cited PMIDs that were actually retrieved
+  faithfulness         — RAGAS faithfulness of gap report vs policy + pubmed contexts
 """
 
 import json
@@ -134,9 +136,8 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
         pmids_cited = _parse_pmids(report)
         ref_pmids = set(item.get("reference_pmids", []))
 
-        # Compare the pipeline's alignment against the INDEPENDENT judge's reference
-        # label (from generate_golden_gap), not against the pipeline's own prior run.
-        alignment_match = (
+        # Raw label agreement vs the INDEPENDENT reference label (diagnostic only).
+        alignment_label_match = (
             1.0
             if actual_alignment and reference_alignment
             and actual_alignment == reference_alignment
@@ -147,6 +148,11 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
         # which was ~1.0 always since the NCD is handed to the model and it's told to cite it.)
         retrieved_ncds = set(item.get("policy_ncds", []))
         ncd_recall = 1.0 if item["expected_ncd"] and item["expected_ncd"] in retrieved_ncds else 0.0
+        # End-to-end alignment_accuracy: credit ONLY when the pipeline reached the
+        # reference alignment AND retrieved the right NCD to reason from. A matching
+        # label built on the wrong retrieved policy is a false success, so gating on
+        # retrieval makes this score reflect retrieval quality, not just reasoning.
+        alignment_accuracy = 1.0 if alignment_label_match and ncd_recall else 0.0
         pmid_recall = (
             len(pmids_cited & ref_pmids) / len(ref_pmids) if ref_pmids else None
         )
@@ -161,7 +167,8 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
             "question": item["question"],
             "reference_alignment": reference_alignment,
             "actual_alignment": actual_alignment,
-            "alignment_accuracy": alignment_match,
+            "alignment_accuracy": alignment_accuracy,
+            "alignment_label_match": alignment_label_match,
             "ncd_recall": ncd_recall,
             "pmid_recall": pmid_recall,
             "citation_precision": citation_precision,
@@ -217,6 +224,7 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
 
     rows_df = pd.DataFrame(rows)
     scores["alignment_accuracy"] = round(float(rows_df["alignment_accuracy"].mean()), 3)
+    scores["alignment_label_match"] = round(float(rows_df["alignment_label_match"].mean()), 3)
     scores["ncd_recall"] = round(float(rows_df["ncd_recall"].mean()), 3)
     if rows_df["pmid_recall"].notna().any():
         scores["pmid_recall"] = round(float(rows_df["pmid_recall"].mean(skipna=True)), 3)
