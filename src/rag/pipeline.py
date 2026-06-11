@@ -25,11 +25,11 @@ PIPELINE_CONFIG = {
     "reranker": "BAAI/bge-reranker-base",
     "reranker_top_n": 5,
     "search_mode": "hybrid",
+    "pubmed_k": 8,  # abstracts pulled per NCD topic for gap analysis
 }
 
 _reranker: CrossEncoder | None = None
 _bm25: BM25Retriever | None = None
-_pubmed_bm25: BM25Retriever | None = None
 _db = None  # cached Chroma instance — avoid reopening on every query
 _pubmed_db = None  # cached PubMed Chroma instance
 
@@ -68,21 +68,6 @@ def _get_bm25(k: int) -> BM25Retriever:
         logger.info("BM25 index built over %d CMS chunks", len(docs))
     _bm25.k = k
     return _bm25
-
-
-def _get_pubmed_bm25(k: int) -> BM25Retriever:
-    """Build (once) and return a BM25 retriever over the full PubMed index."""
-    global _pubmed_bm25
-    if _pubmed_bm25 is None:
-        result = _get_pubmed_db().get(include=["documents", "metadatas"])
-        docs = [
-            Document(page_content=text, metadata=meta)
-            for text, meta in zip(result["documents"], result["metadatas"])
-        ]
-        _pubmed_bm25 = BM25Retriever.from_documents(docs)
-        logger.info("BM25 index built over %d PubMed abstracts", len(docs))
-    _pubmed_bm25.k = k
-    return _pubmed_bm25
 
 
 def _hybrid_retrieve(query: str, k: int) -> list[Document]:
@@ -126,34 +111,6 @@ def _hybrid_retrieve_ncd(query: str, k: int) -> list[Document]:
         d for d in _get_bm25(k).invoke(query)
         if d.metadata.get("source") == "NCD"
     ]
-
-    scores: dict[str, float] = {}
-    doc_map: dict[str, Document] = {}
-    for rank, doc in enumerate(dense_docs):
-        key = doc.page_content
-        scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank + 1)
-        doc_map[key] = doc
-    for rank, doc in enumerate(bm25_docs):
-        key = doc.page_content
-        scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank + 1)
-        doc_map[key] = doc
-
-    ranked = sorted(scores, key=lambda x: scores[x], reverse=True)
-    return [doc_map[k_] for k_ in ranked[:k]]
-
-
-def _hybrid_retrieve_pubmed(query: str, k: int) -> list[Document]:
-    """Fuse BM25 + dense vector results for the PubMed collection via RRF.
-
-    No cross-encoder reranking — bge-reranker-base is trained on web/passage pairs,
-    not clinical abstracts, and the raw hybrid candidates are sufficient quality.
-    """
-    db = _get_pubmed_db()
-    dense_docs = db.as_retriever(
-        search_type="similarity_score_threshold",
-        search_kwargs={"k": k, "score_threshold": PIPELINE_CONFIG["threshold"]},
-    ).invoke(query)
-    bm25_docs = _get_pubmed_bm25(k).invoke(query)
 
     scores: dict[str, float] = {}
     doc_map: dict[str, Document] = {}
@@ -340,7 +297,9 @@ _GAP_SYSTEM = (
     "CMS Coverage Position: [Covered | Not Covered | Covered with Conditions | Not Addressed]\n"
     "  - [NCD number]: [criteria exactly as written]\n\n"
     "Clinical Evidence:\n"
-    "  - [PMID year, journal]: [key finding and study type — 1 sentence]\n"
+    "  - PMID <number> (<year>, <journal>): [key finding and study type — 1 sentence]\n"
+    "  ALWAYS begin each bullet with the literal token 'PMID' followed by the numeric\n"
+    "  PubMed ID exactly as it appears in the abstracts (e.g. 'PMID 12811203').\n"
     "  (one bullet per abstract; write 'No relevant abstracts retrieved' if none)\n\n"
     "Evidence Grade: [Strong — RCT or meta-analysis | Moderate — cohort or observational | Weak / Insufficient]\n\n"
     "Alignment: [Aligned | Partially Aligned | Conflicting | "
@@ -402,13 +361,10 @@ def gap_analysis(
     }
 
     try:
-        pubmed_docs: list[Document] = _pubmed_for_ncds(question, ncd_numbers, k=8)
-        if not pubmed_docs:
-            # No abstracts indexed for these NCDs — fall back to an open hybrid
-            # search so the report still has evidence to reason over (no topical
-            # guarantee in this path).
-            logger.info("No NCD-matched abstracts — falling back to open hybrid PubMed search")
-            pubmed_docs = _hybrid_retrieve_pubmed(question, k=8)
+        # Topical join only. If an NCD has no indexed abstracts we return nothing,
+        # so the report yields "Insufficient Evidence" rather than comparing the
+        # policy against unrelated abstracts pulled by an open (non-topical) search.
+        pubmed_docs: list[Document] = _pubmed_for_ncds(question, ncd_numbers, k=PIPELINE_CONFIG["pubmed_k"])
         # Sort newest-first so Gemini weights recent evidence more heavily.
         pubmed_docs.sort(key=lambda d: d.metadata.get("year", "0"), reverse=True)
     except RuntimeError:

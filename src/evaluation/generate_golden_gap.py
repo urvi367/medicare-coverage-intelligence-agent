@@ -149,6 +149,20 @@ def _format_abstracts(abstracts: list[dict]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
+def canonical_alignment(text: str) -> str:
+    """Map a free-form alignment string to a canonical rubric label, or "" if none.
+
+    Matches longest label first so "Partially Aligned" is not captured by "Aligned"
+    (a substring). Shared by the labeler and judge_gap so both sides compare on the
+    same canonical vocabulary regardless of trailing em-dash descriptors or notes.
+    """
+    low = text.lower()
+    for lab in sorted(_ALIGNMENT_LABELS, key=len, reverse=True):
+        if lab.lower() in low:
+            return lab
+    return ""
+
+
 def _parse_label(text: str) -> dict:
     """Parse the structured judge response into alignment, key_pmids, rationale."""
     align_m = re.search(r"ALIGNMENT:\s*(.+)", text)
@@ -156,8 +170,7 @@ def _parse_label(text: str) -> dict:
     rat_m = re.search(r"RATIONALE:\s*(.+)", text)
 
     alignment = align_m.group(1).strip() if align_m else ""
-    # Normalize to a canonical rubric label (judge may add trailing punctuation/notes).
-    canon = next((lab for lab in _ALIGNMENT_LABELS if lab.lower() in alignment.lower()), alignment)
+    canon = canonical_alignment(alignment) or alignment
 
     pmids: list[str] = []
     if pmid_m and "none" not in pmid_m.group(1).lower():

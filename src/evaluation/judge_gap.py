@@ -22,6 +22,8 @@ sys.modules.setdefault("langchain_community.chat_models.vertexai", MagicMock())
 
 from dotenv import load_dotenv
 
+from src.evaluation.generate_golden_gap import canonical_alignment
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -33,9 +35,14 @@ JUDGE_MODEL = "gemini-2.5-flash"
 
 
 def _gap_cache_path() -> Path:
+    """Cache path keyed by every config knob that changes retrieval, so a config
+    change starts a fresh cache instead of silently reusing stale gap answers."""
     from src.rag.pipeline import PIPELINE_CONFIG
     cfg = PIPELINE_CONFIG
-    name = f"gap_answers_cache_k{cfg['k']}_threshold{cfg['threshold']}.json"
+    name = (
+        f"gap_answers_cache_k{cfg['k']}_t{cfg['threshold']}"
+        f"_n{cfg['reranker_top_n']}_pk{cfg['pubmed_k']}.json"
+    )
     return Path(__file__).parents[2] / "logs" / name
 
 
@@ -46,7 +53,8 @@ def _parse_alignment(text: str) -> str:
 
 
 def _parse_ncd_numbers(text: str) -> set[str]:
-    return set(re.findall(r"\b\d{2,3}\.\d{1,2}(?:\.\d{1,2})*\b", text))
+    # 1–3 digit prefix so single-digit NCD sections (e.g. 1.2) match alongside 100.x.
+    return set(re.findall(r"\b\d{1,3}\.\d{1,2}(?:\.\d{1,2})*\b", text))
 
 
 def _parse_pmids(text: str) -> set[str]:
@@ -117,8 +125,12 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
     rows = []
     for item in cached:
         report = item["gap_report"]
-        actual_alignment = _parse_alignment(report)
-        reference_alignment = item.get("reference_alignment", "")
+        # Canonicalize BOTH sides to the rubric vocabulary before comparing. The
+        # pipeline emits labels with em-dash descriptors ("Coverage Gap — evidence
+        # supports...") while the reference is bare ("Coverage Gap"); an exact-string
+        # compare would spuriously fail. canonical_alignment collapses both.
+        actual_alignment = canonical_alignment(_parse_alignment(report))
+        reference_alignment = canonical_alignment(item.get("reference_alignment", ""))
         ncds_cited = _parse_ncd_numbers(report)
         pmids_cited = _parse_pmids(report)
         ref_pmids = set(item.get("reference_pmids", []))
@@ -128,7 +140,7 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
         alignment_match = (
             1.0
             if actual_alignment and reference_alignment
-            and actual_alignment.lower() == reference_alignment.lower()
+            and actual_alignment == reference_alignment
             else 0.0
         )
         ncd_recall = 1.0 if item["expected_ncd"] and item["expected_ncd"] in ncds_cited else 0.0
