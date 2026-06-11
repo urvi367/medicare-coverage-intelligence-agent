@@ -91,16 +91,16 @@ Prototype: https://medicare-coverage-agent.streamlit.app/
 
 ## Evaluation Results
 
-Evaluated on 79 NCD questions (LCD entries excluded — Phase 1). Config: k=10, threshold=0.65, reranker top_n=5. Judge: gemini-2.5-flash.
+Evaluated on 79 NCD questions (LCD entries excluded — Phase 1). Config: k=10, threshold=0.65, reranker top_n=5, search_mode=hybrid. Judge: gemini-2.5-flash.
 
 | Metric | Score | Target |
 |---|:---:|:---:|
-| Faithfulness | 0.821 | > 0.90 |
-| Answer Relevancy | **0.857** ✅ | > 0.85 |
-| Context Precision | **0.892** ✅ | > 0.80 |
-| Empty Retrieval | **1.3%** ✅ | < 15% |
-| Citation Accuracy | 0.886 | > 95% |
-| Policy Recall | **0.962** ✅ | > 90% |
+| Faithfulness | 0.854 | > 0.90 |
+| Answer Relevancy | 0.833 | > 0.85 |
+| Context Precision | **0.917** ✅ | > 0.80 |
+| Empty Retrieval | **0.0%** ✅ | < 15% |
+| Citation Accuracy | **0.911** | > 95% |
+| Policy Recall | **0.987** ✅ | > 90% |
 
 ---
 

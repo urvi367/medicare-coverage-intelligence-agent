@@ -37,6 +37,7 @@ NCD subset only (119/198 LCD entries excluded — Phase 1). Append a row after e
 | 2026-06-09 19:02 | 79 NCD | 5 | 0.70 | 5 | 0.860 | 0.761 | **0.832** ✅ | 7.6% | 0.899 | HTML strip fix + title prepend + synonym expansion. Context Precision target met. Faithfulness still below no-reranker baseline — reranker remains suspect. |
 | 2026-06-09 23:42 | 79 NCD | 10 | 0.65 | 5 | 0.782 | 0.827 | 0.921 | 0.0% | 0.949 | ⚠️ CONTAMINATED — index had 8473 chunks (4× duplicates from append-on-rebuild). Judge upgraded to flash. Numbers not comparable to prior rows. |
 | 2026-06-10 00:57 | 78 NCD‡ | 10 | 0.65 | 5 | 0.821 | **0.857** ✅ | **0.892** ✅ | 1.3% | 0.886 | **First clean baseline** — deduplicated index (1983 chunks), double-escape entity fix, LCD addendum top-doc fix. Answer Relevancy target met. |
+| 2026-06-10 | 79 NCD | 10 | 0.65 | 5 | 0.854 | 0.833 | **0.917** ✅ | **0.0%** ✅ | 0.911 | Hybrid BM25+dense RRF retrieval. Policy Recall 0.987 ✅. AR dipped slightly (-0.024); all other metrics improved. |
 
 † Citation accuracy 0.135 is a measurement artifact — old cache entries lack `source_policy_numbers`; regex fallback understates true rate.
 ‡ 1 additional empty retrieval vs prior runs (78 RAGAS samples instead of 79).
@@ -96,12 +97,12 @@ Phase 1 uses RAG + prompt engineering — no agent loop. Coverage policy lookup 
 
 | Metric | How measured | Target | Current |
 |---|---|---|---|
-| Faithfulness | RAGAS Faithfulness | > 90% | 0.821 |
-| Answer Relevancy | RAGAS AnswerRelevancy | > 85% | **0.857 ✅** |
-| Context Precision | RAGAS LLMContextPrecisionWithoutReference | > 80% | **0.892 ✅** |
-| Citation accuracy | Policy numbers from retrieved docs appear in response | > 95% | 0.886 |
-| Empty retrieval rate | % queries returning no chunks | < 15% | **1.3% ✅** |
-| Policy recall | Expected NCD policy number present in retrieved chunks | > 90% | **0.962 ✅** |
+| Faithfulness | RAGAS Faithfulness | > 90% | 0.854 |
+| Answer Relevancy | RAGAS AnswerRelevancy | > 85% | 0.833 |
+| Context Precision | RAGAS LLMContextPrecisionWithoutReference | > 80% | **0.917 ✅** |
+| Citation accuracy | Policy numbers from retrieved docs appear in response | > 95% | 0.911 |
+| Empty retrieval rate | % queries returning no chunks | < 15% | **0.0% ✅** |
+| Policy recall | Expected NCD policy number present in retrieved chunks | > 90% | **0.987 ✅** |
 | False coverage rate | % responses incorrectly stating "covered" — manually audited | **0% — critical** | Pending audit |
 | Response time p95 | End-to-end latency | < 8s | — |
 | Cost per query | Embedding + reranking + generation + judge | < $0.06 | ~$0.004 |
