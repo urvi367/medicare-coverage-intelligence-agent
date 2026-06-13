@@ -240,7 +240,7 @@ Medical policy teams currently pay $200K–500K per engagement for periodic manu
 | 4. Gap synthesis | `gemini-2.5-flash` — temperature=0 | Structured report: **CMS Coverage Position · Clinical Evidence (one `PMID <id>` bullet per abstract) · Evidence Grade · Alignment · Gap Summary**. Prompt forbids citing PMIDs not in the provided abstracts; pins Evidence Grade/Alignment to "Insufficient" when no abstracts are retrieved. |
 | 5. Delivery | Streamlit | Separate "CMS Policy Sources" and "PubMed Evidence" expanders (PMID · year · journal · excerpt). Interactions logged with `mode`, parsed `alignment`, and both source sets. |
 
-**Alignment taxonomy:** Aligned · Partially Aligned · Conflicting · Coverage Gap (evidence supports, CMS doesn't cover) · Inverse Gap (CMS covers, evidence weak) · Insufficient Evidence.
+**Alignment taxonomy (action-oriented, by direction of divergence):** Aligned (CMS & evidence agree — no action) · Partial Coverage Gap (covers, but narrower than evidence supports — broaden) · Coverage Gap (evidence supports, CMS doesn't cover/denies — expand/appeal) · Overcoverage (CMS covers, evidence weak/absent/negative — utilization review) · Insufficient Evidence (can't judge — manual review). Each label maps to one analyst action; there is deliberately no "conflicting" label — a divergence is classified by *which side is ahead*, since that determines the action.
 
 **Full LCD jurisdiction implementation (still deferred):** MAC region UI, reviewer jurisdiction profile, LCD re-admission to eval, MAC-region retrieval filtering — not yet built.
 

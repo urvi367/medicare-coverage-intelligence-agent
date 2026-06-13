@@ -113,7 +113,8 @@ Beyond "what does CMS cover?", the agent answers "where is CMS coverage out of s
 
 - **Policy side:** NCD-only hybrid retrieval + cross-encoder rerank (top 5).
 - **Topical join:** PubMed abstracts are pulled *only for the NCD(s) retrieved on the policy side* (`source_ncd_number == policy_number`), so evidence and coverage position describe the same intervention. Dense top-8, newest-first, no reranker (bge-reranker isn't trained on clinical text). Empty join → "Insufficient Evidence" rather than unrelated abstracts.
-- **Synthesis:** `gemini-2.5-flash` emits a structured report — CMS Coverage Position · Clinical Evidence (`PMID` bullets) · Evidence Grade · Alignment (Aligned / Partially / Conflicting / Coverage Gap / Inverse Gap / Insufficient) · Gap Summary. The prompt forbids citing un-retrieved PMIDs.
+- **Synthesis:** `gemini-2.5-flash` emits a structured report — CMS Coverage Position · Clinical Evidence (`PMID` bullets) · Evidence Grade · Alignment · Gap Summary. The prompt forbids citing un-retrieved PMIDs.
+- **Action-oriented alignment** — each label maps to one analyst action, classified by *which side is ahead*: Aligned (no action) · Partial Coverage Gap (broaden) · Coverage Gap (expand/appeal) · Overcoverage (utilization review) · Insufficient Evidence (manual review).
 - **Evidence corpus:** 2,457 PubMed abstracts (`pubmed_evidence` collection) across 294 NCD topics via NCBI E-utilities.
 
 </details>
