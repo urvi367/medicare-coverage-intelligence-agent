@@ -101,29 +101,36 @@ broadening. Action: broaden criteria.
 - Coverage Gap — the evidence supports the service but CMS does not cover it, or \
 explicitly denies it. Evidence is ahead of policy. Action: expand coverage / appeal. \
 THIS is the key actionable finding.
-- Overcoverage — CMS covers it, but the retrieved evidence is weak, absent, or shows it \
-does NOT work. Coverage is ahead of evidence. Action: utilization review.
+- Overcoverage — CMS covers it, but the on-topic evidence shows it does NOT work (clearly \
+weak or negative results). Coverage is ahead of evidence. Action: utilization review. \
+(Note: evidence merely *absent* is Insufficient Evidence, not Overcoverage.)
 - Insufficient Evidence — fewer than 2 abstracts actually report clinical outcomes for \
 THIS intervention applied to THIS condition. Abstracts about a different indication or \
 population, methodology only, or background/history do NOT count, even if real studies.
 
 Decision procedure — follow IN ORDER (do not jump to a gap label):
-1. Evidence gate: count abstracts that directly report clinical outcomes of THIS \
-intervention for THIS condition. If fewer than 2 → Insufficient Evidence (stop here). \
-Do NOT rescue off-topic abstracts with a scope argument.
-2. Establish CMS's position from the policy text: does CMS COVER this service — fully, \
-or only for a narrower population/indication — or does it NOT cover / explicitly deny it?
-3. Establish what the evidence shows: supports the service, does not support it, or mixed.
+1. EVIDENCE GATE (unconditional — apply it even when CMS covers the service): count the \
+abstracts that directly report clinical outcomes of THIS intervention for THIS condition. \
+If fewer than 2 → Insufficient Evidence, STOP. A topic with no on-topic outcome evidence \
+is Insufficient Evidence even if CMS clearly covers it — it is NOT Aligned (you cannot \
+confirm agreement with no evidence) and NOT a gap. Do not rescue off-topic abstracts with \
+a scope argument.
+2. Establish CMS's coverage position from the policy text. First ask: does CMS cover this \
+service for ANY indication at all? — yes (fully), yes (only a narrow population/indication), \
+or no (non-covered / explicitly denied for all indications)?
+3. Establish what the on-topic evidence shows: supports the service, shows it does not \
+work, or mixed.
 4. Map CMS position against the evidence (by direction, not CMS's rhetoric):
-   - CMS covers it AND the evidence supports it → Aligned
-   - CMS does NOT cover/denies it AND the evidence does NOT support it → Aligned (agree)
+   - CMS covers it (any indication) AND the evidence supports it → Aligned
+   - CMS does NOT cover it for any indication AND the evidence does not support it → Aligned
    - CMS covers it but more narrowly than the evidence supports → Partial Coverage Gap
-   - CMS does NOT cover/denies it BUT the evidence supports it → Coverage Gap
-   - CMS covers it BUT the evidence is weak/absent/shows it does not work → Overcoverage
-Whether CMS "passively does not cover" or "actively denies citing weak evidence" does \
-not change the label — only the direction does. There is no separate "conflicting" label.
-Coverage Gap and Overcoverage require that CMS's position and the evidence actually \
-DISAGREE; if CMS covers a service the evidence supports, that is Aligned, not a gap.
+   - CMS does NOT cover it for ANY indication BUT the evidence supports it → Coverage Gap
+   - CMS covers it BUT the on-topic evidence shows it does not work → Overcoverage
+CRITICAL: if CMS covers the service for even one indication, it can ONLY be Aligned, \
+Partial Coverage Gap, or Overcoverage — NEVER a full Coverage Gap. Full Coverage Gap is \
+reserved for services CMS covers for NO indication. Whether CMS "passively does not cover" \
+or "actively denies citing weak evidence" does not change the label — only direction does. \
+There is no separate "conflicting" label.
 
 Calibration examples (illustrative only — cite ONLY PMIDs from the abstracts below):
 
@@ -160,6 +167,19 @@ study acupuncture for post-stroke fatigue and fibromyalgia, not low-back pain.
 ALIGNMENT: Insufficient Evidence
 RATIONALE: The abstracts are about different conditions, so they do not bear on this \
 coverage decision.
+
+Example 7 — CMS covers a clotting-factor drug only for patients with major active \
+bleeding who failed other therapies; the abstracts (RCTs) support its use ALSO for \
+routine prophylaxis to prevent bleeds.
+ALIGNMENT: Partial Coverage Gap
+RATIONALE: CMS already covers the drug for one indication, so this is a narrowing, not a \
+full non-coverage gap — the evidence supports broadening to prophylaxis.
+
+Example 8 — CMS covers an epidural blood graft for post-spinal-tap headache; the \
+retrieved abstracts do not report clinical outcomes for this procedure/condition.
+ALIGNMENT: Insufficient Evidence
+RATIONALE: There is no on-topic outcome evidence, so agreement cannot be confirmed — \
+covered-with-no-evidence is Insufficient Evidence, not Aligned.
 
 Reason ONLY from the documents provided. Do not use outside knowledge of newer policy.
 
