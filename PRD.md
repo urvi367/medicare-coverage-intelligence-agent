@@ -1,7 +1,8 @@
 # Medicare Coverage Intelligence Platform — PRD
 
 **Product:** Medicare Coverage Intelligence Platform
-**Domain:** Health Insurance / Utilization Management
+**Domain:** Provider Revenue Cycle — Prior Authorization & Denial Management
+**Primary user:** Provider-side RCM/UM team — denial *prevention* pre-service (Phase 1) and denial *appeals* post-denial (Phase 2)
 **Data sources:** CMS NCDs/LCDs (Phase 1) · PubMed (Phase 2)
 
 ---
@@ -227,7 +228,16 @@ Phase 1 uses RAG + prompt engineering — no agent loop. Coverage policy lookup 
 Phase 1 answers: *"What does CMS cover for this?"*
 Phase 2 answers: *"Where is CMS coverage out of step with published clinical evidence?"*
 
-Medical policy teams currently pay $200K–500K per engagement for periodic manual PubMed-vs-CMS reviews. Phase 2 automates this continuously. Introduced after Phase 1 reaches stable quality (Faithfulness > 90% ✅, False Coverage Rate = 0%).
+### 12.1 Persona — same workflow, back door instead of front door
+
+The aligned user is **provider-side denial-management / appeals specialists** — specifically those handling **medical-necessity** and **experimental / investigational** denials. This is not a second audience; it is the *other end of the same revenue-cycle workflow* Phase 1 serves:
+
+- **Phase 1 sits at the front of the revenue cycle** — pre-service: *prevent* the denial by getting coverage criteria and documentation right before submitting.
+- **Phase 2 sits at the back** — the service was denied anyway, usually as *"not medically necessary"* or *"experimental/investigational,"* and someone now has to build the appeal.
+
+That appeal is *exactly* an evidence-vs-coverage argument: the NCD/LCD doesn't cover this (or covers it too narrowly), **but here is the current literature supporting medical necessity for this patient.** That is precisely the structured gap report Phase 2 produces — the `Coverage Gap` and `Partial Coverage Gap` labels, with cited PMIDs and evidence grade, are the backbone of the appeal letter.
+
+Same provider organization, same RCM / UM team, often the same patient — **prevention at the front door (Agent 1), recovery at the back door (Agent 2).** Medical policy teams (payer-side) also pay $200K–500K per engagement for periodic manual PubMed-vs-CMS reviews; Phase 2 automates that continuously, but the primary aligned persona is the provider appeals specialist. Introduced after Phase 1 reaches stable quality (Faithfulness > 90% ✅, False Coverage Rate = 0%).
 
 ---
 

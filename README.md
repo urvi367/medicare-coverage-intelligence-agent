@@ -110,6 +110,8 @@ Evaluated on 79 NCD questions (LCD entries excluded — Phase 1). Config: k=10, 
 
 Beyond "what does CMS cover?", the agent answers "where is CMS coverage out of step with published evidence?" The UI auto-routes each question to Policy Q&A or Gap Analysis by regex signal scoring — no manual toggle.
 
+**Who it's for:** the same provider revenue-cycle team, at the *back* door. Phase 1 prevents denials pre-service; Phase 2 serves **denial-management / appeals specialists** building appeals for *"not medically necessary"* and *"experimental/investigational"* denials. That appeal is an evidence-vs-coverage argument — the NCD/LCD doesn't cover it, but here's the literature supporting medical necessity — which is exactly the `Coverage Gap` / `Partial Coverage Gap` report (cited PMIDs + evidence grade) this produces.
+
 <details>
 <summary><strong>How gap analysis works</strong></summary>
 
