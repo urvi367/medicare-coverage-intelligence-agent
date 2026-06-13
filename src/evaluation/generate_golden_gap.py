@@ -36,6 +36,21 @@ _GROQ_DELAY = 2.0  # free tier ~30 RPM → 2s gap keeps well under the limit
 _MAX_NCD_CHARS = 8000
 _MAX_ABSTRACT_CHARS = 2500
 
+# NCDs whose coverage is restricted by statute/law rather than clinical evidence.
+# The evidence-vs-coverage gap framing does not apply (no amount of evidence changes a
+# legal restriction), so they are excluded from the gap golden set. Extend as found.
+# NOTE: the 210.x screening series ("statutory" preventive services) are NOT here — those
+# are statutorily *mandated*, evidence-based coverage, valid for gap analysis.
+_STATUTORY_EXCLUSIONS = {
+    "140.1",  # Abortion — coverage restricted by the Hyde Amendment, not evidence
+    "140.4",  # Plastic Surgery to Correct "Moon Face" — cosmetic exclusion, §1862(a)(10)
+}
+
+# Retired / rescinded / superseded NCDs have no current coverage position, so the
+# evidence-vs-coverage gap framing is meaningless. Detected by the title marker CMS
+# stamps on them (e.g. "- RETIRED", "(Replaced with Section 220.6.17)").
+_RETIRED_RE = re.compile(r"-\s*RETIRED|\bRETIRED\b|rescinded|replaced with section", re.I)
+
 _GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 _GROQ_MODEL = "llama-3.1-8b-instant"
 
@@ -319,6 +334,14 @@ def generate(max_ncds: int | None = None) -> list[dict]:
         policy_number = ncd["policy_number"]
         if policy_number in done_ncds:
             logger.info("  Skipping [%d/%d] (done): %s", i, len(ncds), ncd["title"][:60])
+            continue
+        if policy_number in _STATUTORY_EXCLUSIONS:
+            logger.info("  Skipping [%d/%d] (statutory restriction, not evidence-based): %s",
+                        i, len(ncds), ncd["title"][:60])
+            continue
+        if _RETIRED_RE.search(ncd["title"]):
+            logger.info("  Skipping [%d/%d] (retired/superseded NCD): %s",
+                        i, len(ncds), ncd["title"][:60])
             continue
 
         logger.info("  Labeling [%d/%d]: %s", i, len(ncds), ncd["title"][:60])
