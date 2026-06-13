@@ -54,9 +54,11 @@ NCD subset only (119/198 LCD entries excluded — Phase 1). Append a row after e
 
 ## 1. Problem & Opportunity
 
-UM reviewers and medical policy teams spend 15–30 min manually searching CMS Medicare Coverage Database per query. The CMS interface requires knowing exact CMS terminology (not clinical terminology), and coverage logic is buried in dense 5,000–10,000 word documents. A wrong answer — stating covered when policy says not covered — can cause wrongful denials, audit findings, or member harm. Every output must be grounded and cited.
+The key user is **provider-side prior-authorization and denial-prevention staff** — PA coordinators, utilization-review nurses, and revenue-cycle / denial-management teams at hospitals and practices — who must confirm a planned service meets Medicare coverage criteria *before* submitting the prior-auth request or claim. When they miss a criterion, the result is a denial: rework, delayed patient care, appeals, and lost revenue. Preventing that denial at submission time is the job to be done.
 
-CMS-0057-F (2024) mandated increased PA transparency, giving plans that systematically document coverage policy review a compliance and legal defensibility advantage.
+Today they spend 15–30 min per query manually searching the CMS Medicare Coverage Database, which requires exact CMS terminology (not clinical terminology) and buries coverage logic in dense 5,000–10,000 word documents. A wrong answer — stating covered when policy says not covered — drives exactly the denial they are trying to prevent, so every output must be grounded and cited.
+
+CMS-0057-F (2024) mandated increased prior-authorization transparency and faster decisions, raising the value of getting coverage right at submission time.
 
 ---
 
@@ -64,11 +66,12 @@ CMS-0057-F (2024) mandated increased PA transparency, giving plans that systemat
 
 | User | Job to be done | Pain |
 |---|---|---|
-| UM nurses / PA reviewers | Determine whether a service meets Medicare medical necessity criteria before a PA decision | Manual search, CMS ≠ clinical terminology, conditional logic buried in dense documents |
-| Medical policy analysts | Monitor policy accuracy and currency against evidence | No systematic tool to track gaps between internal policy, CMS, and evidence |
-| Appeals reviewers | Find policy + clinical evidence within 30–72 hour window | Manual PubMed + CMS search under time pressure |
+| **Provider-side PA / denial-prevention staff (KEY persona)** | Confirm a planned service meets Medicare coverage criteria *before* submitting the PA request/claim, to prevent denials | Manual CMS search, CMS ≠ clinical terminology, criteria buried in long documents — a missed criterion becomes a denial, rework, and an appeal |
+| Provider utilization-review / PA nurses | Determine whether a service meets medical necessity criteria before submission | Same search burden under throughput pressure across many cases |
+| Denial-management / appeals staff | Find the governing policy + evidence to overturn a denial within the appeal window | Manual PubMed + CMS search under a 30–72 hour clock |
+| Medical policy analysts | Monitor policy currency against evidence | No systematic tool to track gaps between internal policy, CMS, and evidence |
 
-> UM reviewers have zero tolerance for AI overconfidence. A hallucinated coverage determination that gets acted on is worse than no tool at all.
+> Denial-prevention staff have zero tolerance for AI overconfidence. A hallucinated "covered" that gets acted on causes the exact denial the tool is meant to prevent — worse than no tool at all.
 
 ---
 
@@ -80,7 +83,7 @@ Phase 1 uses RAG + prompt engineering — no agent loop. Coverage policy lookup 
 
 | Step | Component | Details |
 |---|---|---|
-| 1. Input validation | Rule-based filter | Block PHI. Flag member-specific queries. |
+| 1. Input validation | Rule-based filter | Block PHI. Flag patient-specific queries. |
 | 2. Query embedding | `BAAI/bge-small-en-v1.5` (local CPU) | Same model used at index and query time. Zero API cost. |
 | 3. Hybrid retrieval | BM25 + ChromaDB + RRF | BM25 sparse (k=10) + dense vector search (k=10, threshold=0.65) fused via Reciprocal Rank Fusion (k=60). BM25 handles exact term/numeric matches; dense handles semantic similarity. Up to 20 merged candidates passed to reranker. |
 | 4. Cross-encoder reranking | `BAAI/bge-reranker-base` (local CPU) | Scores each (query, chunk) pair jointly. Selects top 5 of merged candidates — real filtering, not just reordering. |

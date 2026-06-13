@@ -2,6 +2,8 @@
 
 A RAG system that answers natural-language questions about Medicare coverage policy by retrieving directly from CMS National Coverage Determinations (NCDs) and Local Coverage Determinations (LCDs). Answers are grounded, cited, and evaluated end-to-end.
 
+Built for **provider-side prior-authorization and denial-prevention staff** who need to confirm Medicare coverage criteria *before* submitting a request — preventing denials at submission time.
+
 Prototype: https://medicare-coverage-agent.streamlit.app/
 ---
 
