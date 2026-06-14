@@ -109,9 +109,12 @@ whole point: it determines the action.
 Read the CMS policy text and the PubMed abstracts below, then choose EXACTLY one label:
 - Aligned — CMS and the evidence agree: CMS covers it and the evidence supports it, OR \
 CMS does not cover it and the evidence does not support it either. No action needed.
-- Partial Coverage Gap — CMS covers it, but more narrowly than the evidence supports \
-(narrower population, fewer indications, stricter threshold). The evidence supports \
-broadening. Action: broaden criteria.
+- Partial Coverage Gap — CMS covers it, but the evidence clearly supports a SUBSTANTIVE, \
+clinically-distinct broader use the policy excludes: a different population, a separate \
+indication, or a materially looser threshold. The expansion must be REAL, not a marginal \
+restatement of the covered use (e.g. "recurrence detection" when CMS already covers \
+"monitoring response to therapy" is the SAME use → Aligned, not Partial). When genuinely \
+torn between Aligned and Partial, choose Aligned. Action: broaden criteria.
 - Coverage Gap — the evidence supports the service but CMS does not cover it, or \
 explicitly denies it. Evidence is ahead of policy. Action: expand coverage / appeal. \
 THIS is the key actionable finding.
@@ -148,6 +151,10 @@ work, or mixed.
    - CMS covers it but more narrowly than the evidence supports → Partial Coverage Gap
    - CMS does NOT cover it for ANY indication BUT the evidence supports it → Coverage Gap
    - CMS covers it BUT the on-topic evidence shows it does not work → Overcoverage
+ALIGNED vs PARTIAL tie-breaker: Partial requires the evidence to support a SUBSTANTIVE, \
+clinically-distinct indication/population/threshold CMS excludes. If the "broader" evidence \
+is essentially the covered use restated, or the expansion is marginal or ambiguous, label \
+Aligned. Default to Aligned when unsure — do not award Partial for a minor extension.
 CRITICAL: if CMS covers the service for even one indication, it can ONLY be Aligned, \
 Partial Coverage Gap, or Overcoverage — NEVER a full Coverage Gap. Full Coverage Gap is \
 reserved for services CMS covers for NO indication. Whether CMS "passively does not cover" \
