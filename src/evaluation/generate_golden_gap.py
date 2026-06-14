@@ -79,8 +79,12 @@ Write ONE short, natural question a provider-side appeals specialist would ask t
 check whether the clinical evidence supports Medicare's coverage of the service below.
 
 Rules:
-1. LEAD with the specific intervention (and condition, if the title implies one), using \
-the actual clinical terms from the title — this is the most important word in the question.
+1. LEAD with the specific intervention, using the actual clinical terms from the title — \
+this is the most important word. You may name the condition it is used for IF that is \
+unambiguous from the title (e.g. "Alpha-fetoprotein" -> hepatocellular carcinoma; "Cochlear \
+Implantation" -> hearing loss). But if the intervention has SEVERAL possible uses or you \
+are unsure which one the NCD covers (e.g. "Biofeedback Therapy", "Cellular Therapy", "Laser \
+Procedures"), ask about the intervention in GENERAL — do NOT guess a condition.
 2. Keep it to ONE sentence, ~12-20 words, concrete and topic-forward.
 3. You may include at most ONE evidence word ("evidence", "studies", or "trials"). Do NOT \
 pad it with phrases like "randomized controlled trials, observational studies, improved \
@@ -90,6 +94,7 @@ health outcomes, Medicare beneficiaries" — that vocabulary buries the clinical
 Examples:
 - Title "Acupuncture for Fibromyalgia" -> "What does the evidence show about acupuncture for fibromyalgia?"
 - Title "Transcatheter Aortic Valve Replacement (TAVR)" -> "Is there evidence supporting TAVR for severe aortic stenosis?"
+- Title "Biofeedback Therapy" (no condition) -> "What does the evidence show about biofeedback therapy?"
 
 NCD title: {title}
 
