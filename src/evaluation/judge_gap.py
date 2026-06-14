@@ -60,11 +60,14 @@ def _parse_pmids(text: str) -> set[str]:
     return set(re.findall(r"PMID\s*(\d+)", text, re.IGNORECASE))
 
 
-def evaluate(n_samples: int | None = None) -> dict[str, Any]:
+def evaluate(n_samples: int | None = None, faithfulness_max: int | None = None) -> dict[str, Any]:
     """Run gap analysis eval against the golden gap dataset.
 
     Args:
         n_samples: Number of golden examples to evaluate (None = all).
+        faithfulness_max: Cap RAGAS faithfulness to this many samples (None = all).
+            Faithfulness is ~60s/sample (slow); the structural metrics are computed
+            over every sample regardless, so cap this to keep large runs tractable.
 
     Returns:
         Dict of metric name → score.
@@ -191,6 +194,8 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
         )
 
     ragas_items = [item for item in cached if item["policy_contexts"]]
+    if faithfulness_max is not None:
+        ragas_items = ragas_items[:faithfulness_max]
     dfs = []
     for i, item in enumerate(ragas_items, 1):
         if i > 1:
