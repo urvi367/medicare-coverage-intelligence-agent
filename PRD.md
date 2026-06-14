@@ -22,6 +22,7 @@
 | v1.8 | 2026-06-10 | Fix root cause of persistent HTML entities: CMS data is double-escaped (`&amp;gt;` → `&gt;` after one pass). `_strip_html` now unescapes to fixed point. Fix tag regex to spare clinical comparisons (`< 80 mm Hg`). Fix `build_index` silently appending on rebuild (Chroma assigns fresh IDs — index was 8473 chunks / 4× duplication). Add `shutil.rmtree` wipe before rebuild. Fix LCD jurisdiction addendum firing on stray LCD chunks ranked 2nd–5th — now only fires when top-ranked doc is an LCD. First clean baseline established. |
 | v1.9 | 2026-06-10 | Phase 2 scaffold: `src/ingestion/fetch_pubmed.py` (NCBI E-utilities, per-NCD topic search, dedup by PMID) + `src/rag/pubmed_indexer.py` (separate `pubmed_evidence` Chroma collection, safe rebuild). Moved to `phase-2` branch. |
 | v2.0 | 2026-06-10 | Hybrid BM25 + dense retrieval with Reciprocal Rank Fusion (RRF k=60). BM25 fixes numeric threshold retrieval failures (e.g. "55 mmHg"). `search_mode` field added to PIPELINE_CONFIG; cache path now includes mode suffix. Chroma DB object cached in `_get_db()` — no longer reopened per query. Blank chunk filter added to `build_index()`. UI: feedback buttons (positive/partial/negative), full chunk text in sources expander. Deployed to Streamlit Community Cloud (`main` branch). |
+| v2.2 | 2026-06-13 | **Gap eval run + hardening.** 284-record reference fully Claude-adjudicated (67 overrides/24%). Fixed name-collision bug (topical join pulled same-name-different-thing abstracts) via disambiguation in `_GAP_SYSTEM`/`_LABEL_PROMPT`; `LABEL_MODEL` flash-lite→flash. Captured PubMed PublicationType for grounded Evidence Grade. First 40-sample eval then two fixes: topic-forward question regen (`ncd_recall` 0.75→0.925) and `pubmed_k` 8→12 to match the labeler's evidence budget (conservatism halved); `alignment_accuracy` 0.325→0.45, citation_precision 1.0, 0 catastrophic flips. Streamlit model-load crash fixed (disable HF tqdm bars). |
 | v2.1 | 2026-06-11 | **Phase 2 gap analysis implemented** (`phase-2` branch). `gap_analysis()` in pipeline.py: NCD-only hybrid retrieval + rerank (policy side) joined to PubMed evidence via **topical join** (abstracts filtered by `source_ncd_number == policy_number`, so evidence and policy describe the same intervention; empty join → "Insufficient Evidence" rather than unrelated abstracts). PubMed side: dense top-`pubmed_k`(8), no cross-encoder (bge-reranker not trained on clinical text), sorted newest-first. UI auto-routes policy vs gap queries via regex signal scoring (no mode toggle). Fixed PubMed date parser (ElementTree childless-element falsy bug left 99% of years blank); re-fetched → 2457 abstracts, 0% empty years. Gap eval: `generate_golden_gap.py` (independent `gemini-2.5-flash-lite` labeler reads raw NCD + abstracts — breaks circular self-grading; Groq question cache + rate-limit backoff) and `judge_gap.py` (retrieval-gated `alignment_accuracy`, `alignment_label_match`, `ncd_recall`, `pmid_recall`, `citation_precision`, faithfulness over policy+pubmed). Interaction/feedback logging extended with `mode`, `alignment`, and PubMed sources. |
 
 ---
@@ -295,19 +296,27 @@ Breaking the circularity: an early version graded the pipeline against labels pr
 
 **Reference set:** 284 records, each labeled by the flash-lite labeler then **fully hand-adjudicated by Claude** (cross-vendor) against the raw NCD + abstracts — 67 overrides (24%), 217 confirmed. Adjudication surfaced (and fixed) a name-collision bug: the topical join retrieves abstracts fetched by the NCD *title*, so ambiguous titles pull a different same-named intervention (CAR-T for "Cellular Therapy", sacral neuromod for "Bladder Stimulators"). Fixed via a disambiguation step in `_GAP_SYSTEM`/`_LABEL_PROMPT` (flash resolves these to Insufficient; flash-lite cannot, so `LABEL_MODEL` upgraded flash-lite→flash).
 
-### 15.2.1 First gap-eval results (40-sample, 2026-06-13)
+### 15.2.1 Gap-eval results (40-sample, 2026-06-13)
 
-| Metric | Value | Notes |
-|---|---|---|
-| `citation_precision` | **1.00** ✅ | zero fabricated PMIDs |
-| `faithfulness` (n=10) | 0.70 | grounded in retrieved context |
-| `ncd_recall` | 0.75 | retrieval bottleneck (see below) |
-| `alignment_label_match` | 0.40 | raw label agreement |
-| `alignment_accuracy` | 0.325 | end-to-end (label ✓ AND NCD ✓) |
+The first run surfaced two issues; both were fixed and re-run (same 40 NCDs):
 
-**0 catastrophic (Aligned↔Coverage-Gap) flips** — every mismatch is one-step-adjacent (8) or involves Insufficient (13). Two dominant patterns, both partly eval artifacts rather than pipeline bugs: (1) **`Partial/Gap → Insufficient` conservatism** — the pipeline reasons over 8 query-ranked abstracts + the strict collision gate vs the reference's full topic-level pool; in several cases the pipeline's Insufficient is *more* correct. (2) **`ncd_recall = 0.75`** — the synthetic questions are drenched in evidence-meta vocabulary ("RCTs, observational studies, improved outcomes"), which biases retrieval toward the trial-heavy *Coverage-with-Evidence-Development* NCDs (TAVR/TEER/warfarin-PGx) regardless of topic. Real (topic-forward) user queries should retrieve better. Two follow-ups identified: regenerate questions topic-forward; label the reference on the *same* abstracts the pipeline retrieves (isolates reasoning from retrieval).
+| Metric | v1 (k=8, evidence-meta questions) | v2 (k=12, topic-forward questions) | driven by |
+|---|:---:|:---:|---|
+| `ncd_recall` | 0.75 | **0.925** | topic-forward questions (policy-side retrieval; `pubmed_k` doesn't affect it) |
+| `alignment_label_match` | 0.40 | **0.475** | k=12 evidence budget |
+| `alignment_accuracy` (end-to-end) | 0.325 | **0.45** | both |
+| `pmid_recall` | 0.57 | **0.80** | both |
+| `citation_precision` | **1.00** | **1.00** | — (zero fabricated PMIDs) |
+| `faithfulness` | 0.70 (n=10) | **0.78** (n=20) | more/better context |
+| `Partial→Insufficient` conservatism | 6 | **3** | k=12 |
 
-**Known limitations:** strict 5-class exact match reads pessimistically on a subjective task; `label_match` is retrieval-bounded by the evidence the pipeline saw; reference labels are LLM-drafted + Claude-adjudicated (not clinician-validated).
+**0 catastrophic (Aligned↔Coverage-Gap) flips in either run** — mismatches are one-step-adjacent or involve Insufficient.
+
+The two fixes, with clean attribution:
+1. **Topic-forward questions** (`ncd_recall` 0.75→0.925, *purely* the question fix since `ncd_recall` is policy-side). The v1 synthetic questions were drenched in evidence-meta vocabulary ("RCTs, observational studies, improved outcomes"), biasing retrieval toward trial-heavy *Coverage-with-Evidence-Development* NCDs (TAVR/TEER/warfarin-PGx) regardless of topic; topic-forward queries (lead with the intervention) retrieve the right NCD 37/40 times.
+2. **`pubmed_k` 8→12** (conservatism halved 6→3). The reference labeler judges from up to 12 abstracts deliberately (holistic, in lieu of human review); k=8 sometimes under-surfaced the answer the fuller evidence supports. Matching the pipeline's evidence budget to the reference's resolved most of the `Partial/Gap→Insufficient` gap — confirming the reference is the gold standard and k=8 was the limiter, not an unfair handicap.
+
+**Known limitations:** strict 5-class exact match reads pessimistically on a subjective task; reference labels are LLM-drafted + Claude-adjudicated (not clinician-validated).
 
 ### 15.3 Roadmap
 

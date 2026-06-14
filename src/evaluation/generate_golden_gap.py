@@ -75,14 +75,21 @@ _ALIGNMENT_LABELS = [
 ]
 
 _QUESTION_PROMPT = """\
-You are generating evaluation data for a Medicare coverage intelligence system.
+Write ONE short, natural question a provider-side appeals specialist would ask to \
+check whether the clinical evidence supports Medicare's coverage of the service below.
 
-Given the NCD (National Coverage Determination) title below, write one question \
-that:
-1. Asks about the clinical evidence behind the coverage decision
-2. Sounds like a clinician, researcher, or health policy analyst would ask
-3. Uses words like "evidence", "studies", "clinical data", "RCTs", or "research"
-4. Does NOT ask about coverage criteria — only about the supporting evidence
+Rules:
+1. LEAD with the specific intervention (and condition, if the title implies one), using \
+the actual clinical terms from the title — this is the most important word in the question.
+2. Keep it to ONE sentence, ~12-20 words, concrete and topic-forward.
+3. You may include at most ONE evidence word ("evidence", "studies", or "trials"). Do NOT \
+pad it with phrases like "randomized controlled trials, observational studies, improved \
+health outcomes, Medicare beneficiaries" — that vocabulary buries the clinical topic.
+4. Ask about the evidence FOR the service, not about coverage criteria.
+
+Examples:
+- Title "Acupuncture for Fibromyalgia" -> "What does the evidence show about acupuncture for fibromyalgia?"
+- Title "Transcatheter Aortic Valve Replacement (TAVR)" -> "Is there evidence supporting TAVR for severe aortic stenosis?"
 
 NCD title: {title}
 
@@ -422,6 +429,39 @@ def generate(max_ncds: int | None = None) -> list[dict]:
     return existing
 
 
+def regenerate_questions() -> None:
+    """Regenerate ONLY the questions (topic-forward) for existing golden_gap.json
+    records, preserving the adjudicated reference labels.
+
+    Safe because the labeler scores from NCD text + abstracts and never reads the
+    question — so the topic-forward question only changes what the *pipeline* retrieves
+    at eval time, not the reference label. Rebuilds gap_questions.json. Re-run judge_gap
+    with a fresh answer cache afterward (delete logs/gap_answers_cache_*.json).
+    """
+    if not GOLDEN_GAP_PATH.exists():
+        raise FileNotFoundError(f"{GOLDEN_GAP_PATH} not found — run generate() first.")
+    recs = json.loads(GOLDEN_GAP_PATH.read_text(encoding="utf-8"))
+    questions: dict[str, str] = {}
+    for i, r in enumerate(recs, 1):
+        try:
+            q = _groq_question(r["topic"])
+            time.sleep(_GROQ_DELAY)
+        except Exception as e:
+            logger.warning("Groq failed for %s: %s — keeping old question", r["expected_ncd"], e)
+            questions[r["expected_ncd"]] = r["question"]
+            continue
+        r["question"] = q
+        questions[r["expected_ncd"]] = q
+        logger.info("  [%d/%d] %s -> %s", i, len(recs), r["expected_ncd"], q[:75])
+        GOLDEN_GAP_PATH.write_text(json.dumps(recs, indent=2, ensure_ascii=False), encoding="utf-8")
+        QUESTIONS_PATH.write_text(json.dumps(questions, indent=2), encoding="utf-8")
+    logger.info("Regenerated %d questions (labels preserved)", len(recs))
+
+
 if __name__ == "__main__":
+    import sys
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    generate()
+    if "--regen-questions" in sys.argv:
+        regenerate_questions()
+    else:
+        generate()

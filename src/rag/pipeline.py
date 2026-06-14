@@ -25,7 +25,8 @@ PIPELINE_CONFIG = {
     "reranker": "BAAI/bge-reranker-base",
     "reranker_top_n": 5,
     "search_mode": "hybrid",
-    "pubmed_k": 8,  # abstracts pulled per NCD topic for gap analysis
+    "pubmed_k": 12,  # abstracts pulled per NCD topic for gap analysis (matches the
+                     # labeler's evidence budget so the pipeline sees the same evidence)
 }
 
 _reranker: CrossEncoder | None = None
