@@ -55,9 +55,11 @@ _GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 _GROQ_MODEL = "llama-3.1-8b-instant"
 
 # Independent labeler. Reads raw NCD + abstracts; never sees the pipeline's report.
-# flash-lite: cheaper, and a different tier from the pipeline's flash generator —
-# marginally stronger independence for the reference labels.
-LABEL_MODEL = "gemini-2.5-flash-lite"
+# Uses flash (not flash-lite): flash-lite cannot reliably do the name-collision
+# disambiguation (it labels same-name-different-thing abstracts as a Coverage Gap),
+# whereas flash correctly resolves them to Insufficient Evidence. Independence comes
+# from a different prompt + raw evidence (and human adjudication on top), not the tier.
+LABEL_MODEL = "gemini-2.5-flash"
 
 # Action-oriented alignment rubric — each label maps to one analyst action. Organized
 # by DIRECTION of divergence (which side is ahead), not CMS's rhetorical stance, so the
@@ -109,12 +111,20 @@ THIS intervention applied to THIS condition. Abstracts about a different indicat
 population, methodology only, or background/history do NOT count, even if real studies.
 
 Decision procedure — follow IN ORDER (do not jump to a gap label):
+0. NAME-COLLISION CHECK: the abstracts were retrieved by the NCD's TOPIC NAME, so some may \
+be about a DIFFERENT intervention that merely shares the name or a keyword — e.g. a modern \
+therapy with the same name as the obsolete one the NCD describes ("cellular therapy" = \
+lamb-cell injection in the policy, but CAR-T in the abstracts), or a different device for \
+the same organ ("bladder stimulator" implant vs sacral neuromodulation). Read the CMS \
+POLICY text to learn what the intervention ACTUALLY is, then treat an abstract as on-topic \
+ONLY if it studies that SAME intervention for the SAME condition — not just a shared word. \
+Silently discard name-collision abstracts.
 1. EVIDENCE GATE (unconditional — apply it even when CMS covers the service): count the \
-abstracts that directly report clinical outcomes of THIS intervention for THIS condition. \
-If fewer than 2 → Insufficient Evidence, STOP. A topic with no on-topic outcome evidence \
-is Insufficient Evidence even if CMS clearly covers it — it is NOT Aligned (you cannot \
-confirm agreement with no evidence) and NOT a gap. Do not rescue off-topic abstracts with \
-a scope argument.
+remaining on-topic abstracts that directly report clinical outcomes of THIS intervention \
+for THIS condition. If fewer than 2 → Insufficient Evidence, STOP. A topic with no on-topic \
+outcome evidence is Insufficient Evidence even if CMS clearly covers it — it is NOT Aligned \
+(you cannot confirm agreement with no evidence) and NOT a gap. Do not rescue off-topic or \
+name-collision abstracts with a scope argument.
 2. Establish CMS's coverage position from the policy text. First ask: does CMS cover this \
 service for ANY indication at all? — yes (fully), yes (only a narrow population/indication), \
 or no (non-covered / explicitly denied for all indications)?
