@@ -60,6 +60,47 @@ def _parse_pmids(text: str) -> set[str]:
     return set(re.findall(r"PMID\s*(\d+)", text, re.IGNORECASE))
 
 
+# Provider-facing action buckets: the end user is denial-prevention / appeals staff,
+# so what matters is "do I have evidence-based grounds to appeal, or is it covered?".
+# Partial + full Coverage Gap both → appeal; Aligned + Overcoverage both → covered
+# (for a provider, Overcoverage just means it's still paid — utilization review is the
+# payer's job, not theirs).
+_ACTION_BUCKET = {
+    "Coverage Gap": "appeal",
+    "Partial Coverage Gap": "appeal",
+    "Aligned": "covered",
+    "Overcoverage": "covered",
+    "Insufficient Evidence": "manual-review",
+}
+
+# Ordinal "evidence-minus-coverage" direction scale for quadratic-weighted kappa.
+# Insufficient Evidence is off this axis and is excluded from kappa.
+_DIRECTION_ORDER = ["Overcoverage", "Aligned", "Partial Coverage Gap", "Coverage Gap"]
+
+
+def _quadratic_weighted_kappa(pairs: list[tuple[str, str]]) -> float | None:
+    """Cohen's quadratic-weighted kappa over the ordinal direction scale.
+
+    pairs: (reference, actual) label tuples; only labels in _DIRECTION_ORDER count.
+    Near-miss (one-step) disagreements keep most credit; opposite-direction flips are
+    penalized; chance agreement is subtracted.
+    """
+    idx = {lab: i for i, lab in enumerate(_DIRECTION_ORDER)}
+    pairs = [(r, a) for r, a in pairs if r in idx and a in idx]
+    n, N = len(_DIRECTION_ORDER), len(pairs)
+    if N == 0:
+        return None
+    O = [[0] * n for _ in range(n)]
+    for r, a in pairs:
+        O[idx[r]][idx[a]] += 1
+    row = [sum(O[i]) for i in range(n)]
+    col = [sum(O[i][j] for i in range(n)) for j in range(n)]
+    W = [[((i - j) ** 2) / ((n - 1) ** 2) for j in range(n)] for i in range(n)]
+    num = sum(W[i][j] * O[i][j] for i in range(n) for j in range(n))
+    den = sum(W[i][j] * row[i] * col[j] / N for i in range(n) for j in range(n))
+    return round(1 - num / den, 3) if den else None
+
+
 def evaluate(n_samples: int | None = None, faithfulness_max: int | None = None) -> dict[str, Any]:
     """Run gap analysis eval against the golden gap dataset.
 
@@ -156,6 +197,12 @@ def evaluate(n_samples: int | None = None, faithfulness_max: int | None = None) 
         # label built on the wrong retrieved policy is a false success, so gating on
         # retrieval makes this score reflect retrieval quality, not just reasoning.
         alignment_accuracy = 1.0 if alignment_label_match and ncd_recall else 0.0
+        # Provider-facing action match: did the tool put the case in the right action
+        # bucket (appeal / covered / manual-review)? Credits Partial<->Coverage-Gap
+        # (both = appeal) and Aligned<->Overcoverage (both = covered).
+        ref_act = _ACTION_BUCKET.get(reference_alignment)
+        act_act = _ACTION_BUCKET.get(actual_alignment)
+        alignment_action_match = 1.0 if ref_act and act_act and ref_act == act_act else 0.0
         pmid_recall = (
             len(pmids_cited & ref_pmids) / len(ref_pmids) if ref_pmids else None
         )
@@ -172,6 +219,7 @@ def evaluate(n_samples: int | None = None, faithfulness_max: int | None = None) 
             "actual_alignment": actual_alignment,
             "alignment_accuracy": alignment_accuracy,
             "alignment_label_match": alignment_label_match,
+            "alignment_action_match": alignment_action_match,
             "ncd_recall": ncd_recall,
             "pmid_recall": pmid_recall,
             "citation_precision": citation_precision,
@@ -230,6 +278,13 @@ def evaluate(n_samples: int | None = None, faithfulness_max: int | None = None) 
     rows_df = pd.DataFrame(rows)
     scores["alignment_accuracy"] = round(float(rows_df["alignment_accuracy"].mean()), 3)
     scores["alignment_label_match"] = round(float(rows_df["alignment_label_match"].mean()), 3)
+    # Provider-facing: did it land in the right action bucket (appeal/covered/manual)?
+    scores["alignment_action_match"] = round(float(rows_df["alignment_action_match"].mean()), 3)
+    # Chance-corrected, adjacency-aware agreement on the evidence-vs-coverage direction
+    # (excludes Insufficient Evidence, which is off the ordinal axis).
+    scores["alignment_kappa"] = _quadratic_weighted_kappa(
+        [(r["reference_alignment"], r["actual_alignment"]) for r in rows]
+    )
     scores["ncd_recall"] = round(float(rows_df["ncd_recall"].mean()), 3)
     if rows_df["pmid_recall"].notna().any():
         scores["pmid_recall"] = round(float(rows_df["pmid_recall"].mean(skipna=True)), 3)
