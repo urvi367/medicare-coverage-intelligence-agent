@@ -298,25 +298,29 @@ Breaking the circularity: an early version graded the pipeline against labels pr
 
 ### 15.2.1 Gap-eval results (40-sample, 2026-06-13)
 
-The first run surfaced two issues; both were fixed and re-run (same 40 NCDs):
+The first run surfaced issues; three legitimate fixes were applied and re-run (same 40 NCDs):
 
-| Metric | v1 (k=8, evidence-meta questions) | v2 (k=12, topic-forward questions) | driven by |
-|---|:---:|:---:|---|
-| `ncd_recall` | 0.75 | **0.925** | topic-forward questions (policy-side retrieval; `pubmed_k` doesn't affect it) |
-| `alignment_label_match` | 0.40 | **0.475** | k=12 evidence budget |
-| `alignment_accuracy` (end-to-end) | 0.325 | **0.45** | both |
-| `pmid_recall` | 0.57 | **0.80** | both |
-| `citation_precision` | **1.00** | **1.00** | — (zero fabricated PMIDs) |
-| `faithfulness` | 0.70 (n=10) | **0.78** (n=20) | more/better context |
-| `Partial→Insufficient` conservatism | 6 | **3** | k=12 |
+| Metric | v1: k=8, evidence-meta Q | v2: k=12, topic-forward Q | v3: + ported rubric |
+|---|:---:|:---:|:---:|
+| `alignment_accuracy` (end-to-end) | 0.325 | 0.45 | **0.525** |
+| `alignment_label_match` | 0.40 | 0.475 | **0.525** |
+| `alignment_action_match` (provider buckets) | — | 0.525 | **0.525** |
+| `alignment_kappa` (quadratic-weighted) | — | 0.349 | **0.424** |
+| `ncd_recall` | 0.75 | 0.925 | **0.925** |
+| `pmid_recall` | 0.57 | 0.80 | **0.844** |
+| `citation_precision` | **1.00** | **1.00** | **1.00** |
+| `faithfulness` | 0.70 (n=10) | 0.78 (n=20) | 0.76 (n=20) |
 
-**0 catastrophic (Aligned↔Coverage-Gap) flips in either run** — mismatches are one-step-adjacent or involve Insufficient.
+**0 catastrophic (Aligned↔Coverage-Gap) flips in any run.** `alignment_accuracy` rose 0.325→0.525 (+62%) with **no reference dumbing-down** — just better questions, enough evidence, and the same rubric the gold standard uses.
 
-The two fixes, with clean attribution:
-1. **Topic-forward questions** (`ncd_recall` 0.75→0.925, *purely* the question fix since `ncd_recall` is policy-side). The v1 synthetic questions were drenched in evidence-meta vocabulary ("RCTs, observational studies, improved outcomes"), biasing retrieval toward trial-heavy *Coverage-with-Evidence-Development* NCDs (TAVR/TEER/warfarin-PGx) regardless of topic; topic-forward queries (lead with the intervention) retrieve the right NCD 37/40 times.
-2. **`pubmed_k` 8→12** (conservatism halved 6→3). The reference labeler judges from up to 12 abstracts deliberately (holistic, in lieu of human review); k=8 sometimes under-surfaced the answer the fuller evidence supports. Matching the pipeline's evidence budget to the reference's resolved most of the `Partial/Gap→Insufficient` gap — confirming the reference is the gold standard and k=8 was the limiter, not an unfair handicap.
+The three fixes, with clean attribution:
+1. **Topic-forward questions** (`ncd_recall` 0.75→0.925, *purely* the question fix since `ncd_recall` is policy-side). The v1 synthetic questions were drenched in evidence-meta vocabulary ("RCTs, observational studies, improved outcomes"), biasing retrieval toward trial-heavy *Coverage-with-Evidence-Development* NCDs (TAVR/TEER/warfarin-PGx); topic-forward queries (lead with the intervention) retrieve the right NCD 37/40.
+2. **`pubmed_k` 8→12** (`Partial/Gap→Insufficient` conservatism halved 6→3). The labeler judges from up to 12 abstracts deliberately (holistic, in lieu of human review); k=8 under-surfaced the answer the fuller evidence supports. Matching the pipeline's evidence budget to the reference's confirmed the reference is the gold standard and k=8 was the limiter, not an unfair handicap.
+3. **Ported the labeler's decision rubric into `_GAP_SYSTEM`** (`label_match` 0.475→0.525, rising to *equal* `action_match`). Before this, the pipeline often picked the right *action bucket* but the wrong *sub-label* (Partial vs full Coverage Gap); giving it the same ordered procedure + "covers-any-indication→never-a-full-gap" rule eliminated the within-bucket disagreements. Residual misses are now genuinely *cross-action* (appeal vs covered vs manual), not label hairsplitting.
 
-**Known limitations:** strict 5-class exact match reads pessimistically on a subjective task; reference labels are LLM-drafted + Claude-adjudicated (not clinician-validated).
+**Provider-facing metric:** `alignment_action_match` collapses labels to the appeals-specialist action — appeal `{Partial, Coverage Gap}` / covered `{Aligned, Overcoverage}` / manual `{Insufficient}` — measuring whether the tool gets the *decision* right, not the exact severity label.
+
+**Known limitations:** strict 5-class exact match reads pessimistically on a subjective task; reference labels are LLM-drafted + Claude-adjudicated (not clinician-validated). Next lever: spot-check residual mismatches to separate pipeline-error from reference-error (some borderline adjudications are likely the "miss").
 
 ### 15.3 Roadmap
 
