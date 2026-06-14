@@ -293,7 +293,21 @@ Breaking the circularity: an early version graded the pipeline against labels pr
 
 `alignment_accuracy = label_match ∧ ncd_recall`, so the three decompose failures: high `label_match` + low `ncd_recall` ⇒ retrieval is the bottleneck; the reverse ⇒ reasoning is.
 
-**Known limitations:** reference is a single unvalidated flash-lite label (recommend hand-validating ~20 before quoting scores); exact-match over 6 adjacent classes reads pessimistically; `label_match`/`pmid_recall` are retrieval-bounded by the evidence the pipeline saw; labeler/pipeline/judge are all Gemini (partial, not cross-vendor, independence).
+**Reference set:** 284 records, each labeled by the flash-lite labeler then **fully hand-adjudicated by Claude** (cross-vendor) against the raw NCD + abstracts — 67 overrides (24%), 217 confirmed. Adjudication surfaced (and fixed) a name-collision bug: the topical join retrieves abstracts fetched by the NCD *title*, so ambiguous titles pull a different same-named intervention (CAR-T for "Cellular Therapy", sacral neuromod for "Bladder Stimulators"). Fixed via a disambiguation step in `_GAP_SYSTEM`/`_LABEL_PROMPT` (flash resolves these to Insufficient; flash-lite cannot, so `LABEL_MODEL` upgraded flash-lite→flash).
+
+### 15.2.1 First gap-eval results (40-sample, 2026-06-13)
+
+| Metric | Value | Notes |
+|---|---|---|
+| `citation_precision` | **1.00** ✅ | zero fabricated PMIDs |
+| `faithfulness` (n=10) | 0.70 | grounded in retrieved context |
+| `ncd_recall` | 0.75 | retrieval bottleneck (see below) |
+| `alignment_label_match` | 0.40 | raw label agreement |
+| `alignment_accuracy` | 0.325 | end-to-end (label ✓ AND NCD ✓) |
+
+**0 catastrophic (Aligned↔Coverage-Gap) flips** — every mismatch is one-step-adjacent (8) or involves Insufficient (13). Two dominant patterns, both partly eval artifacts rather than pipeline bugs: (1) **`Partial/Gap → Insufficient` conservatism** — the pipeline reasons over 8 query-ranked abstracts + the strict collision gate vs the reference's full topic-level pool; in several cases the pipeline's Insufficient is *more* correct. (2) **`ncd_recall = 0.75`** — the synthetic questions are drenched in evidence-meta vocabulary ("RCTs, observational studies, improved outcomes"), which biases retrieval toward the trial-heavy *Coverage-with-Evidence-Development* NCDs (TAVR/TEER/warfarin-PGx) regardless of topic. Real (topic-forward) user queries should retrieve better. Two follow-ups identified: regenerate questions topic-forward; label the reference on the *same* abstracts the pipeline retrieves (isolates reasoning from retrieval).
+
+**Known limitations:** strict 5-class exact match reads pessimistically on a subjective task; `label_match` is retrieval-bounded by the evidence the pipeline saw; reference labels are LLM-drafted + Claude-adjudicated (not clinician-validated).
 
 ### 15.3 Roadmap
 
