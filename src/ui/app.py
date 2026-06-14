@@ -95,7 +95,7 @@ st.set_page_config(
 
 st.title("Medicare Coverage Intelligence Agent")
 st.caption(
-    "Ask questions about Medicare NCDs and LCDs. "
+    "Ask questions about Medicare NCDs. "
     "Answers are grounded in official CMS policy documents."
 )
 
