@@ -36,14 +36,26 @@ _GROQ_DELAY = 2.0  # free tier ~30 RPM → 2s gap keeps well under the limit
 _MAX_NCD_CHARS = 8000
 _MAX_ABSTRACT_CHARS = 2500
 
-# NCDs whose coverage is restricted by statute/law rather than clinical evidence.
-# The evidence-vs-coverage gap framing does not apply (no amount of evidence changes a
-# legal restriction), so they are excluded from the gap golden set. Extend as found.
-# NOTE: the 210.x screening series ("statutory" preventive services) are NOT here — those
-# are statutorily *mandated*, evidence-based coverage, valid for gap analysis.
-_STATUTORY_EXCLUSIONS = {
-    "140.1",  # Abortion — coverage restricted by the Hyde Amendment, not evidence
-    "140.4",  # Plastic Surgery to Correct "Moon Face" — cosmetic exclusion, §1862(a)(10)
+# NCDs excluded from the gap golden set because the evidence-vs-coverage framing does not apply.
+# Keyed by NCD number → reason (logged on skip so the dropped set stays auditable). Two kinds
+# live here together since both are just "fixed NCD → skip with a reason":
+#   • statutory — coverage restricted by law; no amount of evidence changes a legal restriction.
+#   • administrative/payment — the NCD sets a documentation/billing/service condition, not a
+#     clinical intervention whose published outcomes can be "ahead of" or "behind" policy.
+# The SCOPE CHECK in _LABEL_PROMPT catches administrative NCDs that slip through. Retired/
+# superseded NCDs are detected separately by title via _RETIRED_RE (a regex, not a fixed list),
+# so they are NOT listed here. NOTE: the 210.x screening series are NOT excluded — those are
+# statutorily *mandated*, evidence-based coverage, valid for gap analysis. Extend as found.
+_EXCLUDED_NCDS = {
+    "140.1": "statutory restriction (Hyde Amendment), not evidence-based",
+    "140.4": "statutory cosmetic exclusion §1862(a)(10), not evidence-based",
+    "10.6": "administrative/payment NCD (anesthesia documentation), gap frame N/A",
+    "70.1": "administrative/process NCD (family consultations), gap frame N/A",
+    "20.8.1": "administrative NCD (pacemaker evaluation services), gap frame N/A",
+    "110.2": "administrative NCD (NCI Group C drug distribution program), gap frame N/A",
+    "280.1": "administrative NCD (DME coverage-status reference list, not one intervention), gap frame N/A",
+    "280.2": "non-medical DME exclusion (white cane, self-help mobility device §1861(n)), gap frame N/A",
+    "80.7": "statutory/medical-necessity exclusion (refractive-error correction is not an illness), gap frame N/A",
 }
 
 # Retired / rescinded / superseded NCDs have no current coverage position, so the
@@ -115,9 +127,10 @@ indication, or a materially looser threshold. The expansion must be REAL, not a 
 restatement of the covered use (e.g. "recurrence detection" when CMS already covers \
 "monitoring response to therapy" is the SAME use → Aligned, not Partial). When genuinely \
 torn between Aligned and Partial, choose Aligned. Action: broaden criteria.
-- Coverage Gap — the evidence supports the service but CMS does not cover it, or \
-explicitly denies it. Evidence is ahead of policy. Action: expand coverage / appeal. \
-THIS is the key actionable finding.
+- Coverage Gap — the evidence CONSISTENTLY and credibly supports the service but CMS does \
+not cover it, or explicitly denies it. Evidence is ahead of policy. Action: expand coverage / appeal. \
+THIS is the key actionable finding. (Low-quality or internally mixed positive evidence does NOT \
+clear this bar — see the COVERAGE GAP vs ALIGNED tie-break below.)
 - Overcoverage — CMS covers it, but the on-topic evidence shows it does NOT work (clearly \
 weak or negative results). Coverage is ahead of evidence. Action: utilization review. \
 (Note: evidence merely *absent* is Insufficient Evidence, not Overcoverage.)
@@ -134,6 +147,12 @@ the same organ ("bladder stimulator" implant vs sacral neuromodulation). Read th
 POLICY text to learn what the intervention ACTUALLY is, then treat an abstract as on-topic \
 ONLY if it studies that SAME intervention for the SAME condition — not just a shared word. \
 Silently discard name-collision abstracts.
+0b. SCOPE CHECK: if this NCD sets an ADMINISTRATIVE / PAYMENT / documentation condition rather \
+than testing a clinical intervention whose efficacy can be measured — e.g. when/whether anesthesia \
+is documented as medically necessary, billing or evaluation/management services, process or \
+consultation requirements — the evidence-vs-coverage frame does not apply. Label Insufficient \
+Evidence (manual review) and STOP. This does NOT trigger for clinical-efficacy questions (does \
+intervention X work for condition Y?); only for process/payment/documentation NCDs.
 1. EVIDENCE GATE (unconditional — apply it even when CMS covers the service): count the \
 remaining on-topic abstracts that directly report clinical outcomes of THIS intervention \
 for THIS condition. If fewer than 2 → Insufficient Evidence, STOP. A topic with no on-topic \
@@ -144,7 +163,12 @@ name-collision abstracts with a scope argument.
 service for ANY indication at all? — yes (fully), yes (only a narrow population/indication), \
 or no (non-covered / explicitly denied for all indications)?
 3. Establish what the on-topic evidence shows: supports the service, shows it does not \
-work, or mixed.
+work, or mixed. Each abstract header shows an evidence tier in brackets — T1 highest (meta-analysis/ \
+systematic review), T2 strong (RCT), T3 moderate-strong (clinical trial), T4 moderate (cohort/ \
+observational), T5 weak (case report/series), or background only (review/guideline, not primary \
+evidence). Weight higher tiers more heavily; do NOT treat 'background only' or 'unspecified' abstracts \
+as primary evidence. A Coverage Gap or Overcoverage requires T1-T4 on-topic evidence pointing the same \
+way — not T5, review, guideline, or unspecified abstracts alone.
 4. Map CMS position against the evidence (by direction, not CMS's rhetoric):
    - CMS covers it (any indication) AND the evidence supports it → Aligned
    - CMS does NOT cover it for any indication AND the evidence does not support it → Aligned
@@ -154,7 +178,25 @@ work, or mixed.
 ALIGNED vs PARTIAL tie-breaker: Partial requires the evidence to support a SUBSTANTIVE, \
 clinically-distinct indication/population/threshold CMS excludes. If the "broader" evidence \
 is essentially the covered use restated, or the expansion is marginal or ambiguous, label \
-Aligned. Default to Aligned when unsure — do not award Partial for a minor extension.
+Aligned. Default to Aligned when unsure — do not award Partial for a minor extension. A \
+different graft source, delivery route, device variant, or monitoring duration for the SAME \
+covered service is a technique variation, NOT a substantive excluded indication → Aligned.
+COVERAGE GAP vs ALIGNED tie-breaker (for services CMS does NOT cover): a full Coverage Gap \
+requires the on-topic evidence to support the service reasonably CONSISTENTLY and at a credible \
+quality — e.g. RCTs or meta-analyses pointing the same way, with effects that are clinically \
+meaningful, not merely statistically significant. If CMS has a reasoned non-coverage and the \
+positive evidence is low-GRADE, internally conflicting (some systematic reviews negative), or \
+shows only marginal/below-clinically-meaningful benefit over sham/placebo (a large placebo \
+component), that AGREES with the non-coverage → Aligned, NOT Coverage Gap. Reserve Coverage Gap \
+for evidence that has genuinely moved ahead of the policy; default to Aligned when weak or mixed.
+OVERCOVERAGE guard: Overcoverage requires the negative/ineffective evidence to apply to the COVERED \
+indication or population AS A WHOLE — not merely a narrow subpopulation, a single device/technique \
+variant, an off-label application, or a dosing/threshold question. If the service works for the \
+covered population overall but the evidence is negative only for a subgroup, one variant, or an \
+alternative threshold, that is Partial Coverage Gap (narrow the criteria) or Aligned — NOT \
+Overcoverage. The evidence must show the service is INEFFECTIVE for its covered purpose; known \
+surgical sequelae or side effects of an otherwise-indicated procedure are not "does not work." And \
+if CMS does NOT cover the use the negative evidence addresses, that agreement is Aligned, not Overcoverage.
 CRITICAL: if CMS covers the service for even one indication, it can ONLY be Aligned, \
 Partial Coverage Gap, or Overcoverage — NEVER a full Coverage Gap. Full Coverage Gap is \
 reserved for services CMS covers for NO indication. Whether CMS "passively does not cover" \
@@ -275,12 +317,15 @@ def _abstracts_for_ncd(pubmed_db, ncd_number: str, limit: int = 12) -> list[dict
 
 
 def _format_abstracts(abstracts: list[dict]) -> str:
+    from src.ingestion.fetch_pubmed import evidence_tier
+
     if not abstracts:
         return "No abstracts retrieved for this topic."
     parts = []
     for a in abstracts:
         stype = a.get("study_type") or "study type unspecified"
-        header = f"PMID {a['pmid']} ({a.get('year') or '?'}, {stype}, {a.get('journal') or '?'})"
+        tier = evidence_tier(a.get("study_type", ""))
+        header = f"PMID {a['pmid']} ({a.get('year') or '?'}, {stype} [{tier}], {a.get('journal') or '?'})"
         parts.append(f"{header}\n{a['text'][:_MAX_ABSTRACT_CHARS]}")
     return "\n\n---\n\n".join(parts)
 
@@ -388,9 +433,9 @@ def generate(max_ncds: int | None = None) -> list[dict]:
         if policy_number in done_ncds:
             logger.info("  Skipping [%d/%d] (done): %s", i, len(ncds), ncd["title"][:60])
             continue
-        if policy_number in _STATUTORY_EXCLUSIONS:
-            logger.info("  Skipping [%d/%d] (statutory restriction, not evidence-based): %s",
-                        i, len(ncds), ncd["title"][:60])
+        if policy_number in _EXCLUDED_NCDS:
+            logger.info("  Skipping [%d/%d] (%s): %s",
+                        i, len(ncds), _EXCLUDED_NCDS[policy_number], ncd["title"][:60])
             continue
         if _RETIRED_RE.search(ncd["title"]):
             logger.info("  Skipping [%d/%d] (retired/superseded NCD): %s",

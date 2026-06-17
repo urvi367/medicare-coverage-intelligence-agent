@@ -40,6 +40,33 @@ def _search_pmids(query: str, max_results: int = 10) -> list[str]:
         return []
 
 
+# PubMed publication-type/MeSH filter that prioritises primary clinical evidence over narrative
+# reviews. Meta-analyses and systematic reviews are syntheses but rank highest in the evidence
+# tier, so they are included; the rest are primary designs. Cohort studies frequently lack a
+# ptyp tag, so the MeSH term is included as well.
+_PRIMARY_EVIDENCE_FILTER = (
+    "(Meta-Analysis[ptyp] OR systematic[sb] OR Randomized Controlled Trial[ptyp] "
+    "OR Controlled Clinical Trial[ptyp] OR Clinical Trial[ptyp] OR Observational Study[ptyp] "
+    "OR Comparative Study[ptyp] OR Cohort Studies[Mesh])"
+)
+
+
+def _search_topic_pmids(title: str, n: int) -> list[str]:
+    """PMIDs for a topic, prioritising primary evidence then backfilling to n.
+
+    Pass 1 restricts to primary-evidence publication types/subsets; pass 2 backfills any
+    shortfall with an unrestricted relevance search so rare or obsolete topics (where no
+    primary evidence exists) still return abstracts rather than nothing.
+    """
+    primary = _search_pmids(f"({title}) AND {_PRIMARY_EVIDENCE_FILTER}", n)
+    if len(primary) >= n:
+        return primary[:n]
+    time.sleep(_DELAY)
+    seen = set(primary)
+    backfill = [p for p in _search_pmids(title, n + len(primary)) if p not in seen]
+    return (primary + backfill)[:n]
+
+
 def _extract_year(article: ElementTree.Element) -> str:
     """Extract a 4-digit publication year from a PubmedArticle element.
 
@@ -75,8 +102,16 @@ _EVIDENCE_HIERARCHY = [
     "Guideline",
     "Review",
 ]
-_GENERIC_PUB_TYPES = {"Journal Article", "English Abstract", "Research Support, Non-U.S. Gov't",
-                      "Research Support, U.S. Gov't, Non-P.H.S.", "Published Erratum"}
+# Funding/format/editorial PublicationTypes that are NOT study designs — never use these as
+# the study_type, even as a fallback (otherwise the alphabetical fallback below mislabels e.g.
+# "Research Support, N.I.H., Extramural" as a design).
+_GENERIC_PUB_TYPES = {"Journal Article", "English Abstract", "Published Erratum",
+                      "Research Support, Non-U.S. Gov't", "Research Support, U.S. Gov't, Non-P.H.S.",
+                      "Research Support, U.S. Gov't, P.H.S.", "Research Support, N.I.H., Extramural",
+                      "Research Support, N.I.H., Intramural",
+                      "Research Support, American Recovery and Reinvestment Act",
+                      "Comment", "Editorial", "Letter", "News", "Historical Article", "Biography",
+                      "Portrait", "Autobiography", "Address", "Congress", "Lecture", "Overall"}
 
 
 def _extract_study_type(article: ElementTree.Element) -> str:
@@ -89,7 +124,41 @@ def _extract_study_type(article: ElementTree.Element) -> str:
         if t in types:
             return t
     meaningful = types - _GENERIC_PUB_TYPES
-    return sorted(meaningful)[0] if meaningful else ""
+    if meaningful:
+        return sorted(meaningful)[0]
+    # Fallback: PubMed often tags an observational design via MeSH rather than PublicationType.
+    # Infer a cohort/observational design from study-design MeSH headings so these don't fall
+    # to "unspecified" (they are genuine moderate-tier primary evidence).
+    mesh = {el.text for el in article.findall(".//MeshHeading/DescriptorName") if el.text}
+    if mesh & {"Cohort Studies", "Case-Control Studies", "Cross-Sectional Studies",
+               "Prospective Studies", "Retrospective Studies", "Longitudinal Studies",
+               "Follow-Up Studies"}:
+        return "Observational Study"
+    return ""
+
+
+# Evidence tier for gap-analysis grading, mapping NLM PublicationType -> a single ranked tier.
+# Tiers (strongest first): T1 meta-analysis/systematic review; T2 RCT; T3 clinical trial;
+# T4 cohort/observational/comparative; T5 case report/series; background = review/guideline
+# (synthesis, not primary evidence); unspecified = no design tag (treat as background/weak).
+def evidence_tier(study_type: str) -> str:
+    """Map a PublicationType string to a gap-analysis evidence tier label."""
+    t = (study_type or "").strip()
+    if t in ("Meta-Analysis", "Systematic Review"):
+        return "T1 highest (meta-analysis/systematic review)"
+    if t == "Randomized Controlled Trial":
+        return "T2 strong (RCT)"
+    if t.startswith("Clinical Trial") or t == "Controlled Clinical Trial":
+        return "T3 moderate-strong (clinical trial)"
+    if t in ("Observational Study", "Comparative Study", "Multicenter Study",
+             "Evaluation Study", "Validation Study", "Cohort Studies"):
+        return "T4 moderate (cohort/observational)"
+    if t in ("Case Reports", "Case Report"):
+        return "T5 weak (case report/series)"
+    if t in ("Review", "Scoping Review", "Practice Guideline", "Guideline",
+             "Consensus Development Conference"):
+        return "background only (review/guideline, not primary evidence)"
+    return "unspecified (treat as background/weak)"
 
 
 def _fetch_abstracts(pmids: list[str]) -> list[dict[str, Any]]:
@@ -140,11 +209,15 @@ def _fetch_abstracts(pmids: list[str]) -> list[dict[str, Any]]:
     return records
 
 
-def fetch_and_save(max_per_topic: int = 10) -> Path:
+def fetch_and_save(max_per_topic: int = 12) -> Path:
     """Search PubMed for each NCD title, fetch abstracts, and save to data/pubmed_raw.json.
 
+    Uses a primary-evidence-first search per topic (see _search_topic_pmids) so the corpus is
+    biased toward RCTs/meta-analyses/cohort studies rather than narrative reviews.
+
     Args:
-        max_per_topic: Max abstracts to fetch per NCD topic (default 10).
+        max_per_topic: Max abstracts to fetch per NCD topic (default 12, matches the gap
+            analysis evidence budget in the labeler and pipeline).
 
     Returns:
         Path to the saved JSON file.
@@ -166,7 +239,7 @@ def fetch_and_save(max_per_topic: int = 10) -> Path:
         logger.info("  [%d/%d] %s", i, len(topics), query)
 
         time.sleep(_DELAY)
-        pmids = _search_pmids(query, max_per_topic)
+        pmids = _search_topic_pmids(topic["title"], max_per_topic)
         if not pmids:
             continue
 

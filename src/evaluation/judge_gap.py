@@ -212,6 +212,17 @@ def evaluate(n_samples: int | None = None, faithfulness_max: int | None = None) 
         citation_precision = (
             len(pmids_cited & retrieved_pmids) / len(pmids_cited) if pmids_cited else None
         )
+        # Retrieval-grounded recall: of the reference PMIDs the pipeline ACTUALLY retrieved,
+        # how many did it cite? Plain pmid_recall conflates two things — the labeler's
+        # reference PMIDs come from a deterministic col.get ordering, while the pipeline
+        # retrieves by question-relevance (hybrid + reranker), so a reference PMID may never
+        # be surfaced and can't possibly be cited. This variant isolates citation BEHAVIOR
+        # from that retrieval-mechanism mismatch. None when no reference PMID was retrieved.
+        ref_pmids_retrieved = ref_pmids & retrieved_pmids
+        pmid_recall_retrieved = (
+            len(pmids_cited & ref_pmids_retrieved) / len(ref_pmids_retrieved)
+            if ref_pmids_retrieved else None
+        )
 
         rows.append({
             "question": item["question"],
@@ -222,6 +233,7 @@ def evaluate(n_samples: int | None = None, faithfulness_max: int | None = None) 
             "alignment_action_match": alignment_action_match,
             "ncd_recall": ncd_recall,
             "pmid_recall": pmid_recall,
+            "pmid_recall_retrieved": pmid_recall_retrieved,
             "citation_precision": citation_precision,
         })
 
@@ -242,8 +254,12 @@ def evaluate(n_samples: int | None = None, faithfulness_max: int | None = None) 
         )
 
     ragas_items = [item for item in cached if item["policy_contexts"]]
-    if faithfulness_max is not None:
-        ragas_items = ragas_items[:faithfulness_max]
+    if faithfulness_max is not None and len(ragas_items) > faithfulness_max:
+        # Random (seeded) subsample rather than the first-N slice: faithfulness is a
+        # corpus-quality signal, so a representative spread across the dataset is a
+        # truer estimate than the alphabetical head — and keeps the slow RAGAS calls
+        # capped to minimize API usage. Seeded for reproducibility.
+        ragas_items = random.Random(42).sample(ragas_items, faithfulness_max)
     dfs = []
     for i, item in enumerate(ragas_items, 1):
         if i > 1:
@@ -288,6 +304,10 @@ def evaluate(n_samples: int | None = None, faithfulness_max: int | None = None) 
     scores["ncd_recall"] = round(float(rows_df["ncd_recall"].mean()), 3)
     if rows_df["pmid_recall"].notna().any():
         scores["pmid_recall"] = round(float(rows_df["pmid_recall"].mean(skipna=True)), 3)
+    if rows_df["pmid_recall_retrieved"].notna().any():
+        scores["pmid_recall_retrieved"] = round(
+            float(rows_df["pmid_recall_retrieved"].mean(skipna=True)), 3
+        )
     if rows_df["citation_precision"].notna().any():
         scores["citation_precision"] = round(float(rows_df["citation_precision"].mean(skipna=True)), 3)
     scores["n"] = len(cached)
