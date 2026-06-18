@@ -14,3 +14,8 @@ data/pubmed_raw.json
 data/golden_dataset.json
 data/golden_gap.json
 data/gap_questions.json
+data/_backup_preingest/
+data/_*.log
+
+# scripts — keep reusable tooling (*.py), ignore large per-run review dumps
+scripts/_*.txt

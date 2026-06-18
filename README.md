@@ -115,11 +115,11 @@ Beyond "what does CMS cover?", the agent answers "where is CMS coverage out of s
 <details>
 <summary><strong>How gap analysis works</strong></summary>
 
-- **Policy side:** NCD-only hybrid retrieval + cross-encoder rerank (top 5).
-- **Topical join:** PubMed abstracts are pulled *only for the NCD(s) retrieved on the policy side* (`source_ncd_number == policy_number`), so evidence and coverage position describe the same intervention. Dense top-8, newest-first, no reranker (bge-reranker isn't trained on clinical text). Empty join → "Insufficient Evidence" rather than unrelated abstracts.
-- **Synthesis:** `gemini-2.5-flash` emits a structured report — CMS Coverage Position · Clinical Evidence (`PMID` bullets) · Evidence Grade · Alignment · Gap Summary. The prompt forbids citing un-retrieved PMIDs.
+- **Policy side (whole-NCD context):** NCD-only hybrid retrieval + cross-encoder rerank is used only to *identify* the governing NCD via a score-weighted vote (sigmoid of the reranker logit; a runner-up NCD is added only if within 70% of the top, capped at 2). The **full text of that NCD** is then supplied — not just the top-5 chunks — so the eligibility-criteria section (which distinguishes a *Partial Coverage Gap* from *Aligned*) can't be dropped by chunk ranking.
+- **Topical join:** PubMed abstracts are pulled *only for the primary NCD(s)* (`source_ncd_number == policy_number`), so evidence and coverage position describe the same intervention. Dense top-12, newest-first, no reranker (bge-reranker isn't trained on clinical text). Empty join → "Insufficient Evidence" rather than unrelated abstracts.
+- **Synthesis:** `gemini-2.5-flash` emits a structured report — CMS Coverage Position · Clinical Evidence (`PMID` bullets, tier-graded T1–T5) · Evidence Grade · Alignment · Gap Summary. The prompt forbids citing un-retrieved PMIDs.
 - **Action-oriented alignment** — each label maps to one analyst action, classified by *which side is ahead*: Aligned (no action) · Partial Coverage Gap (broaden) · Coverage Gap (expand/appeal) · Overcoverage (utilization review) · Insufficient Evidence (manual review).
-- **Evidence corpus:** 2,457 PubMed abstracts (`pubmed_evidence` collection) across 294 NCD topics via NCBI E-utilities.
+- **Evidence corpus:** 3,219 PubMed abstracts (`pubmed_evidence` collection) across 296 NCD topics via NCBI E-utilities, ~89% primary evidence (two-pass primary-evidence search + MeSH study-type fallback).
 
 </details>
 
@@ -134,6 +134,7 @@ Reference labels come from an **independent `gemini-2.5-flash-lite` judge** that
 | `alignment_label_match` | Diagnostic: raw label agreement (retrieval-blind) |
 | `ncd_recall` | Expected NCD surfaced by retrieval |
 | `pmid_recall` | Fraction of key reference PMIDs cited |
+| `pmid_recall_retrieved` | Citation recall over reference PMIDs actually retrieved (isolates citation behavior from the retrieval-mechanism mismatch) |
 | `citation_precision` | Fraction of cited PMIDs that were actually retrieved |
 | `faithfulness` | RAGAS faithfulness vs policy + PubMed contexts |
 
@@ -173,7 +174,7 @@ src/
 data/                         # committed to git
 ├── ncd_raw.json              # Raw NCD data from CMS API
 ├── lcd_raw.json              # Raw LCD data from CMS API
-└── chroma/                   # ChromaDB — cms_coverage (1983) + pubmed_evidence (2457)
+└── chroma/                   # ChromaDB — cms_coverage (1983) + pubmed_evidence (3219)
 
 data/                         # gitignored
 ├── pubmed_raw.json           # PubMed abstracts (Phase 2)

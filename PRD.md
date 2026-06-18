@@ -24,6 +24,7 @@
 | v2.0 | 2026-06-10 | Hybrid BM25 + dense retrieval with Reciprocal Rank Fusion (RRF k=60). BM25 fixes numeric threshold retrieval failures (e.g. "55 mmHg"). `search_mode` field added to PIPELINE_CONFIG; cache path now includes mode suffix. Chroma DB object cached in `_get_db()` — no longer reopened per query. Blank chunk filter added to `build_index()`. UI: feedback buttons (positive/partial/negative), full chunk text in sources expander. Deployed to Streamlit Community Cloud (`main` branch). |
 | v2.2 | 2026-06-13 | **Gap eval run + hardening.** 284-record reference fully Claude-adjudicated (67 overrides/24%). Fixed name-collision bug (topical join pulled same-name-different-thing abstracts) via disambiguation in `_GAP_SYSTEM`/`_LABEL_PROMPT`; `LABEL_MODEL` flash-lite→flash. Captured PubMed PublicationType for grounded Evidence Grade. First 40-sample eval then two fixes: topic-forward question regen (`ncd_recall` 0.75→0.925) and `pubmed_k` 8→12 to match the labeler's evidence budget (conservatism halved); `alignment_accuracy` 0.325→0.45, citation_precision 1.0, 0 catastrophic flips. Streamlit model-load crash fixed (disable HF tqdm bars). |
 | v2.1 | 2026-06-11 | **Phase 2 gap analysis implemented** (`phase-2` branch). `gap_analysis()` in pipeline.py: NCD-only hybrid retrieval + rerank (policy side) joined to PubMed evidence via **topical join** (abstracts filtered by `source_ncd_number == policy_number`, so evidence and policy describe the same intervention; empty join → "Insufficient Evidence" rather than unrelated abstracts). PubMed side: dense top-`pubmed_k`(8), no cross-encoder (bge-reranker not trained on clinical text), sorted newest-first. UI auto-routes policy vs gap queries via regex signal scoring (no mode toggle). Fixed PubMed date parser (ElementTree childless-element falsy bug left 99% of years blank); re-fetched → 2457 abstracts, 0% empty years. Gap eval: `generate_golden_gap.py` (independent `gemini-2.5-flash-lite` labeler reads raw NCD + abstracts — breaks circular self-grading; Groq question cache + rate-limit backoff) and `judge_gap.py` (retrieval-gated `alignment_accuracy`, `alignment_label_match`, `ncd_recall`, `pmid_recall`, `citation_precision`, faithfulness over policy+pubmed). Interaction/feedback logging extended with `mode`, `alignment`, and PubMed sources. |
+| v2.3 | 2026-06-17 | **Primary-evidence re-ingest + whole-NCD gap context + full 277-record eval.** (1) Re-fetched PubMed with a two-pass primary-evidence filter (RCT/meta-analysis/systematic-review/cohort first, unrestricted backfill) + MeSH study-type fallback → **3,219 abstracts / 296 topics**, ~89% primary evidence (was ~75% review/background). (2) Tier-aware grading (T1–T5 + background/unspecified) threaded through `fetch_pubmed.evidence_tier`, the labeler, and `_GAP_SYSTEM`. (3) Re-labeled + Claude-adjudicated golden set → **277 records** (excluded 280.2 white-cane & 80.7 refractive-keratoplasty as non-medical/statutory; 18 v2 adjudications fixing over-called Coverage-Gap/Overcoverage). (4) Added `pmid_recall_retrieved` (citation recall over *retrieved* reference PMIDs — isolates citation behavior from the labeler-vs-pipeline retrieval-mechanism mismatch; 0.637→0.740 on the same answers) + seeded-random faithfulness subsampling. (5) Sharpened the Partial-vs-Aligned boundary (positive test: policy has explicit eligibility criteria AND evidence supports an excluded-but-eligible population); **reverted** an Insufficient-gate loosening that net-regressed on a 125-record check. (6) **Whole-NCD gap context** — chunk retrieval now only *identifies* the governing NCD via a score-weighted vote (sigmoid-of-logit; runner-up added only if within 70% of top; **capped at 2**), then feeds the full NCD text and scopes evidence to it. Fixes Partial gaps lost when the criteria chunk fell outside the top-5 (e.g. 240.4 CPAP Aligned→Partial). NCD-selection backtest (n=277): primary top-1 **0.830**, expected-in-selected **0.892**. A heuristic CED/admin boilerplate filter was prototyped and **rejected** (reliably regressed CPAP). Full gap eval re-run under whole-NCD context deferred (cost). |
 
 ---
 
@@ -249,8 +250,8 @@ Same provider organization, same RCM / UM team, often the same patient — **pre
 | Step | Component | Details |
 |---|---|---|
 | 1. Routing | `_route()` in `app.py` | Regex signal scoring routes each query to Policy Q&A or Gap Analysis — no manual mode toggle. Evidence words ("evidence", "studies", "RCT") vs policy words ("covered", "criteria", "NCD"). |
-| 2. Policy retrieval | `_hybrid_retrieve_ncd` + rerank | **NCD-only** hybrid BM25+dense (LCDs excluded from gap analysis), RRF-fused, cross-encoder reranked to top 5. |
-| 3. Topical join | `_pubmed_for_ncds` | PubMed abstracts pulled **only for the NCD(s) surfaced on the policy side** (`source_ncd_number == policy_number`), so evidence and coverage position describe the same intervention. Dense top-`pubmed_k`(8), no threshold (the NCD filter is the topicality gate), no cross-encoder (bge-reranker-base is not trained on clinical abstracts), sorted newest-first. **Empty join → "Insufficient Evidence"** rather than unrelated abstracts from an open search. |
+| 2. Policy identification + whole-NCD context | `_hybrid_retrieve_ncd` + `_rerank_scored` + `_select_primary_ncds` + `_full_ncd_docs` | **NCD-only** hybrid BM25+dense (LCDs excluded), RRF-fused, cross-encoder reranked. The reranked chunks only *identify* the governing NCD via a **score-weighted vote** (sigmoid of the cross-encoder logit; a runner-up NCD is added only if within 70% of the top; selection **capped at 2** so an ambiguous query can't pull 3–5 full policies). The **full text of the primary NCD(s)** is then supplied as context — not the top-5 question-similar chunks — so the eligibility-criteria section (which distinguishes a Partial Coverage Gap from Aligned) can't be dropped by chunk ranking (v2.3; e.g. 240.4 CPAP). |
+| 3. Topical join | `_pubmed_for_ncds` | PubMed abstracts pulled **only for the primary NCD(s)** (`source_ncd_number == policy_number`), so evidence and coverage position describe the same intervention. Dense top-`pubmed_k`(12), no threshold (the NCD filter is the topicality gate), no cross-encoder (bge-reranker-base is not trained on clinical abstracts), sorted newest-first. **Empty join → "Insufficient Evidence"** rather than unrelated abstracts from an open search. |
 | 4. Gap synthesis | `gemini-2.5-flash` — temperature=0 | Structured report: **CMS Coverage Position · Clinical Evidence (one `PMID <id>` bullet per abstract) · Evidence Grade · Alignment · Gap Summary**. Prompt forbids citing PMIDs not in the provided abstracts; pins Evidence Grade/Alignment to "Insufficient" when no abstracts are retrieved. |
 | 5. Delivery | Streamlit | Separate "CMS Policy Sources" and "PubMed Evidence" expanders (PMID · year · journal · excerpt). Interactions logged with `mode`, parsed `alignment`, and both source sets. |
 
@@ -265,7 +266,7 @@ Same provider organization, same RCM / UM team, often the same patient — **pre
 | Source | Coverage | Access | Status |
 |---|---|---|---|
 | CMS NCDs/LCDs | 1,983 chunks (`cms_coverage`) | CMS Coverage API | Indexed |
-| PubMed/MEDLINE | **2,457 abstracts** (`pubmed_evidence`) across 294 NCD topics, ≤10 per topic, deduped by PMID | NCBI E-utilities (free, 3 req/s) | **Ingested** — `fetch_pubmed.py` searches per NCD title, parses PMID/title/abstract/year/journal, tags each with `source_ncd_number` for the topical join |
+| PubMed/MEDLINE | **3,219 abstracts** (`pubmed_evidence`) across 296 NCD topics, ≤12 per topic, deduped by PMID; ~89% primary evidence | NCBI E-utilities (free, 3 req/s) | **Ingested (v2.3 re-fetch)** — `fetch_pubmed.py` runs a two-pass per-NCD search (primary-evidence filter: RCT/meta-analysis/systematic-review/cohort first, then unrestricted backfill), captures NLM PublicationType + a MeSH study-type fallback for tier grading, and tags each abstract with `source_ncd_number` for the topical join |
 | ClinicalTrials.gov | ~500K trials | ClinicalTrials API v2 | Planned |
 
 > **PubMed date parsing:** the original parser hit the ElementTree gotcha where a childless `<Year>` element is falsy, so `find(Year) or find(MedlineDate)` skipped real years — 99% of abstracts had blank years. Fixed with explicit `None` checks + a MedlineDate year-regex fallback; re-fetch yields 0% empty years (enables newest-first evidence ordering).
@@ -287,8 +288,11 @@ Breaking the circularity: an early version graded the pipeline against labels pr
 |---|---|---|
 | `alignment_accuracy` | **End-to-end:** reached the reference alignment **AND** retrieved the right NCD (a correct label on the wrong retrieved policy = miss) | > 75% |
 | `alignment_label_match` | Diagnostic: raw label agreement vs reference, retrieval-blind — isolates reasoning from retrieval | — |
+| `alignment_action_match` | Provider action-bucket match — appeal `{Partial, Coverage Gap}` / covered `{Aligned, Overcoverage}` / manual `{Insufficient}` | — |
+| `alignment_kappa` | Quadratic-weighted Cohen's kappa over the ordinal evidence-vs-coverage direction (excludes Insufficient) | — |
 | `ncd_recall` | Expected NCD surfaced into `policy_sources` by retrieval (not parroted from context) | > 90% |
 | `pmid_recall` | Fraction of the reference's key PMIDs the report cited | > 60% |
+| `pmid_recall_retrieved` | Citation recall over reference PMIDs that were **actually retrieved** — isolates citation behavior from the labeler-vs-pipeline retrieval-mechanism mismatch | — |
 | `citation_precision` | Fraction of cited PMIDs that were actually retrieved (catches fabricated citations) | > 95% |
 | `faithfulness` | RAGAS faithfulness of the gap report vs policy + PubMed contexts | > 90% |
 
@@ -322,13 +326,37 @@ The three fixes, with clean attribution:
 
 **Known limitations:** strict 5-class exact match reads pessimistically on a subjective task; reference labels are LLM-drafted + Claude-adjudicated (not clinician-validated). Next lever: spot-check residual mismatches to separate pipeline-error from reference-error (some borderline adjudications are likely the "miss").
 
+### 15.2.2 Full 277-record run + retrieval redesign (2026-06-17, v2.3)
+
+Moved from a 40-sample slice to the **full 277-record** reference set (after re-ingest, re-label, and removal of the two non-medical NCDs). First full run (faithfulness on 15 random samples to cap cost):
+
+| Metric | Full-277 |
+|---|:---:|
+| `alignment_accuracy` (end-to-end) | 0.570 |
+| `alignment_label_match` | 0.581 |
+| `alignment_action_match` | 0.621 |
+| `alignment_kappa` | 0.346 |
+| `ncd_recall` | 0.942 |
+| `pmid_recall` | 0.637 |
+| `pmid_recall_retrieved` | **0.740** |
+| `citation_precision` | **0.998** |
+| `faithfulness` (n=15 random) | 0.597 |
+
+Per-label diagnosis (label_match): Aligned 0.71, Insufficient 0.66, Coverage Gap 0.67, Overcoverage 0.30, **Partial 0.20** — Partial collapsing to Aligned (30/55, 28 with the right NCD retrieved) was the dominant error and a *reasoning* miss, not retrieval. `pmid_recall_retrieved` (0.740) vs `pmid_recall` (0.637) confirmed ~10 pts of the apparent citation "loss" was the retrieval-mechanism mismatch, not the pipeline (precision 0.998 = zero fabrication).
+
+**Retrieval redesign (whole-NCD context).** Root cause of the Partial collapse: chunk-level top-5 retrieval can omit the eligibility-criteria section that defines a Partial gap (240.4 CPAP — the AHI/comorbidity criteria chunk never made the top-5 → Aligned). Fix: identify the governing NCD (score-weighted vote, capped at 2) and feed its full text + scope evidence to it. Spot-checks: 240.4 CPAP Aligned→**Partial** ✓, 100.1 bariatric stays **Aligned** ✓, 260.1 liver still misses (a genuine Partial-vs-Aligned *reasoning* boundary issue, not retrieval — its supporting RCT was confirmed present in the scoped evidence). NCD-selection backtest (n=277, LLM-free): primary top-1 **0.830**, expected-in-selected **0.892** (vs the old "all NCDs in top-5 chunks" 0.942 — the dip is mostly sibling/parent-child NCDs and a deliberate contamination/recall trade; `second_frac=0.7` sits at the knee of the sweep).
+
+**Rejected:** a heuristic CED/admin boilerplate filter (drop research-protocol chunks from the whole-NCD context) — it reliably regressed CPAP Partial→Aligned across 4 runs despite retaining the criteria chunk, so it was reverted. Verdicts are context-composition-sensitive; any content trimming must be section-aware and eval-validated, not heuristic.
+
+**Pending:** a full 277-record gap-eval re-run *under* the whole-NCD context (deferred for cost) to quantify the Partial-recovery lift end-to-end; so far validated only by spot-checks + the NCD-selection backtest.
+
 ### 15.3 Roadmap
 
 | Milestone | Status |
 |---|---|
 | PubMed ingestion + indexing | ✅ Done (2,457 abstracts) |
 | Topical-join retrieval + gap synthesis | ✅ Done |
-| Independent gap eval (golden set + judge) | ✅ Done — pending first full run + human validation |
+| Independent gap eval (golden set + judge) | ✅ Done — first full 277-record run complete (v2.3); re-run under whole-NCD context + human validation pending |
 | Full LCD jurisdiction implementation | Planned |
 | Expert validation (20 gap reports/month) | Planned |
 | Fine-tuning on gap assessments | Planned |
@@ -337,4 +365,4 @@ The three fixes, with clean attribution:
 
 ---
 
-*Medicare Coverage Intelligence Platform · PRD v2.1 · All data sources public · Last updated 2026-06-11*
+*Medicare Coverage Intelligence Platform · PRD v2.3 · All data sources public · Last updated 2026-06-17*
