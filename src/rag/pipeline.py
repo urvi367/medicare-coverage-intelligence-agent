@@ -1,6 +1,7 @@
 """RAG pipeline: retrieve CMS coverage docs and generate answers with Gemini."""
 
 import logging
+import math
 import random
 import re
 import time
@@ -145,14 +146,71 @@ def _pubmed_for_ncds(query: str, ncd_numbers: set[str], k: int) -> list[Document
     return db.similarity_search(query, k=k, filter=flt)
 
 
-def _rerank(query: str, docs: list[Document], top_n: int = 3) -> list[Document]:
-    """Score (query, doc) pairs with a cross-encoder and return the top_n docs."""
+def _rerank_scored(query: str, docs: list[Document], top_n: int) -> list[tuple[float, Document]]:
+    """Score (query, doc) pairs with a cross-encoder; return top_n as (score, doc)."""
     if not docs:
-        return docs
+        return []
     pairs = [(query, d.page_content) for d in docs]
     scores = _get_reranker().predict(pairs)
     ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
-    return [doc for _, doc in ranked[:top_n]]
+    return [(float(s), d) for s, d in ranked[:top_n]]
+
+
+def _rerank(query: str, docs: list[Document], top_n: int = 3) -> list[Document]:
+    """Score (query, doc) pairs with a cross-encoder and return the top_n docs."""
+    return [doc for _, doc in _rerank_scored(query, docs, top_n)]
+
+
+def _full_ncd_docs(ncd_number: str) -> list[Document]:
+    """Return ALL indexed chunks for one NCD.
+
+    A coverage determination is a single document; ranking its internal chunks can
+    drop the eligibility-criteria section (the part that distinguishes Partial gaps
+    from Aligned), so for gap analysis we feed the whole policy rather than only the
+    chunks most similar to the question.
+    """
+    got = _get_db().get(
+        where={"policy_number": ncd_number}, include=["documents", "metadatas"]
+    )
+    return [
+        Document(page_content=t, metadata=m)
+        for t, m in zip(got["documents"], got["metadatas"])
+    ]
+
+
+def _select_primary_ncds(
+    scored: list[tuple[float, Document]], second_frac: float = 0.7
+) -> list[str]:
+    """Collapse reranked NCD chunks to the primary NCD by score-weighted vote.
+
+    Sum each NCD's reranker relevance (sigmoid of the cross-encoder logit, so the
+    threshold is meaningful and stray negative-scored chunks don't dominate) across
+    the reranked chunks, and pick the top NCD. A SECOND NCD is included only when its
+    aggregate score is within `second_frac` of the top — the rare case of genuine
+    co-governance (a general NCD + a sub-NCD). Otherwise gap analysis reasons over a
+    single policy, which both restores the criteria text and drops weakly-relevant
+    stray NCDs that would otherwise contaminate the verdict.
+    """
+    agg: dict[str, float] = {}
+    for score, d in scored:
+        n = d.metadata.get("policy_number")
+        if not n:
+            continue
+        agg[n] = agg.get(n, 0.0) + 1.0 / (1.0 + math.exp(-score))
+    if not agg:
+        return []
+    ranked = sorted(agg.items(), key=lambda x: x[1], reverse=True)
+    top_n, top_s = ranked[0]
+    chosen = [top_n]
+    # Add at most ONE more NCD — the runner-up, and only if it's within second_frac of
+    # the top. Capping at two is deliberate: when many NCDs score similarly the result
+    # is an ambiguous query, not genuine co-governance, and pulling 3-5 full policies in
+    # would reintroduce exactly the cross-policy contamination this design removes.
+    if len(ranked) > 1:
+        runner_n, runner_s = ranked[1]
+        if top_s > 0 and runner_s >= second_frac * top_s:
+            chosen.append(runner_n)
+    return chosen
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -410,20 +468,31 @@ def gap_analysis(
     """
     k_ = k or PIPELINE_CONFIG["k"]
 
-    policy_docs: list[Document] = _rerank(
+    # Use chunk retrieval only to IDENTIFY the governing NCD, then feed its full text.
+    reranked = _rerank_scored(
         question,
         _hybrid_retrieve_ncd(question, k_),
         top_n=PIPELINE_CONFIG["reranker_top_n"],
     )
+    primary_ncds = _select_primary_ncds(reranked)
 
-    # Topical join: pull evidence only for the NCD(s) surfaced on the policy side,
-    # so the abstracts and the coverage position are guaranteed to be about the
-    # same intervention (rather than two independent searches that may diverge).
-    ncd_numbers = {
-        d.metadata.get("policy_number")
-        for d in policy_docs
-        if d.metadata.get("policy_number")
-    }
+    if primary_ncds:
+        # Whole-NCD context: a coverage determination is one document, so supply the
+        # complete policy (covered + non-covered indications + criteria) rather than
+        # the handful of question-similar chunks, which can omit the criteria section.
+        policy_docs: list[Document] = [d for n in primary_ncds for d in _full_ncd_docs(n)]
+        ncd_numbers = set(primary_ncds)
+    else:
+        # Fallback (no policy_number on any chunk): keep the reranked chunks as-is.
+        policy_docs = [d for _, d in reranked]
+        ncd_numbers = {
+            d.metadata.get("policy_number")
+            for d in policy_docs
+            if d.metadata.get("policy_number")
+        }
+
+    # Topical join: pull evidence only for the primary NCD(s), so the abstracts and
+    # the coverage position are guaranteed to describe the same intervention.
 
     try:
         # Topical join only. If an NCD has no indexed abstracts we return nothing,
