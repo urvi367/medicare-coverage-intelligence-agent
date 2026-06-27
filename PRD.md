@@ -329,19 +329,7 @@ The three fixes, with clean attribution:
 
 ### 15.2.2 Full 277-record runs: top-5-chunk baseline → whole-NCD redesign (v2.3–v2.4)
 
-**Baseline (top-5-chunk, 2026-06-17, v2.3).** Moved from a 40-sample slice to the **full 277-record** reference set (after re-ingest, re-label, and removal of the two non-medical NCDs). First full run (faithfulness on 15 random samples to cap cost):
-
-| Metric | Full-277 |
-|---|:---:|
-| `alignment_accuracy` (end-to-end) | 0.570 |
-| `alignment_label_match` | 0.581 |
-| `alignment_action_match` | 0.621 |
-| `alignment_kappa` | 0.346 |
-| `ncd_recall` | 0.942 |
-| `pmid_recall` | 0.637 |
-| `pmid_recall_retrieved` | **0.740** |
-| `citation_precision` | **0.998** |
-| `faithfulness` (n=15 random) | 0.597 |
+**Baseline (top-5-chunk, 2026-06-17, v2.3).** Moved from a 40-sample slice to the **full 277-record** reference set (after re-ingest, re-label, and removal of the two non-medical NCDs); faithfulness on 15 random samples to cap cost. Baseline numbers are the left column of the consolidated table below.
 
 Per-label diagnosis (label_match): Aligned 0.71, Insufficient 0.66, Coverage Gap 0.67, Overcoverage 0.30, **Partial 0.20** — Partial collapsing to Aligned (30/55, 28 with the right NCD retrieved) was the dominant error and a *reasoning* miss, not retrieval. `pmid_recall_retrieved` (0.740) vs `pmid_recall` (0.637) confirmed ~10 pts of the apparent citation "loss" was the retrieval-mechanism mismatch, not the pipeline (precision 0.998 = zero fabrication).
 
