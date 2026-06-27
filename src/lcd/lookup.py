@@ -56,14 +56,24 @@ class LcdLookupError(RuntimeError):
 
 
 def _lcd_list() -> list[dict]:
-    """Fetch (and cache for the process) the full final-LCD list."""
+    """Fetch (and cache for the process) the ACTIVE final-LCD list.
+
+    RETIRED LCDs are excluded — a retired determination is no longer in effect and
+    must not drive a coverage decision (the LCD analog of the retired-NCD exclusions
+    in generate_golden_gap). The 'final-lcds' endpoint includes retired records, so
+    we filter on `retirement_date` (the string "N/A" for active ones). Future-effective
+    LCDs are kept: they are the published, governing determination (just a pending
+    revision date), not retired.
+    """
     global _list_cache
     if _list_cache is None:
         try:
-            _list_cache = _paginate(_LCD_LIST_ENDPOINT)
+            raw = _paginate(_LCD_LIST_ENDPOINT)
         except Exception as e:  # network / HTTP / JSON
             raise LcdLookupError(f"LCD list fetch failed: {e}") from e
-        logger.info("LCD list cached: %d records", len(_list_cache))
+        _list_cache = [x for x in raw if (x.get("retirement_date") or "N/A").strip() == "N/A"]
+        logger.info("LCD list cached: %d active (%d retired excluded)",
+                    len(_list_cache), len(raw) - len(_list_cache))
     return _list_cache
 
 
