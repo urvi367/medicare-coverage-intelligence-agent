@@ -15,20 +15,23 @@ from src.rag.pipeline import (
     _rerank_scored,
 )
 
-THRESHOLDS = [0.5, 0.6, 0.7, 0.8, 0.9]
+# Hold the cap at 2 (production behavior); sweep second_frac alone. frac=0.0 is the
+# cap-2 recall CEILING (always take the runner-up); frac=1.0 ~ top-1 only.
+THRESHOLDS = [0.0, 0.3, 0.5, 0.6, 0.65, 0.7, 0.75, 0.8, 0.9, 1.0]
 
 
 def select(agg: dict[str, float], frac: float) -> list[str]:
+    """Mirror production `_select_primary_ncds`: top NCD + at most ONE runner-up,
+    included only if within `frac` of the top (cap held at 2)."""
     if not agg:
         return []
     ranked = sorted(agg.items(), key=lambda x: x[1], reverse=True)
     top_n, top_s = ranked[0]
     chosen = [top_n]
-    for n, s in ranked[1:]:
-        if top_s > 0 and s >= frac * top_s:
-            chosen.append(n)
-        else:
-            break
+    if len(ranked) > 1:
+        runner_n, runner_s = ranked[1]
+        if top_s > 0 and runner_s >= frac * top_s:
+            chosen.append(runner_n)
     return chosen
 
 
@@ -60,7 +63,7 @@ def main() -> None:
                 inset += 1
             if len(pri) > 1:
                 multi += 1
-        print(f"{frac:>6.1f} {top1/total:>8.3f} {inset/total:>8.3f} {multi/total:>8.3f}")
+        print(f"{frac:>6.2f} {top1/total:>8.3f} {inset/total:>8.3f} {multi/total:>8.3f}")
 
 
 if __name__ == "__main__":
