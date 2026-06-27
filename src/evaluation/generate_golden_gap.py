@@ -180,7 +180,12 @@ clinically-distinct indication/population/threshold CMS excludes. If the "broade
 is essentially the covered use restated, or the expansion is marginal or ambiguous, label \
 Aligned. Default to Aligned when unsure — do not award Partial for a minor extension. A \
 different graft source, delivery route, device variant, or monitoring duration for the SAME \
-covered service is a technique variation, NOT a substantive excluded indication → Aligned.
+covered service is a technique variation, NOT a substantive excluded indication → Aligned. \
+The excluded population must be NAMED and concrete and must be treated with the SAME covered \
+intervention: evidence about a DIFFERENT intervention (another drug, procedure, vaccine, or \
+program) — even for the same or a related condition — is NOT a Partial gap in THIS policy → \
+Aligned; and a vague "broader use is suggested" with no named population, or a speculative / \
+forward-looking use ("likely not yet FDA-approved"), is NOT Partial → Aligned.
 COVERAGE GAP vs ALIGNED tie-breaker (for services CMS does NOT cover): a full Coverage Gap \
 requires the on-topic evidence to support the service reasonably CONSISTENTLY and at a credible \
 quality — e.g. RCTs or meta-analyses pointing the same way, with effects that are clinically \
