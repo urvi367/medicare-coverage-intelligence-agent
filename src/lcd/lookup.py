@@ -39,7 +39,11 @@ _TEXT_FIELDS = (
     "indications_limitations", "indications_limitations_text",
     "indication", "coverage_guidance", "summary_of_evidence",
 )
-_SHORTLIST_K = 10  # bi-encoder cosine shortlist before cross-encoder scoring
+# bi-encoder cosine shortlist before cross-encoder scoring. Kept generous: the
+# bi-encoder ranks synonym/terse-query matches surprisingly low (e.g. "panniculectomy"
+# -> "Plastic Surgery" at cosine rank ~17), and the cross-encoder is the precision
+# gate, so a larger shortlist improves recall without hurting precision.
+_SHORTLIST_K = 30
 
 _list_cache: list[dict] | None = None
 _embedder = None
