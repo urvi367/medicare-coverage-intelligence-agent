@@ -178,34 +178,103 @@ def _full_ncd_docs(ncd_number: str) -> list[Document]:
     ]
 
 
+# Disambiguation: when the top reranked NCDs score close together, the score-weighted
+# argmax is unreliable (top-1 accuracy ~0.83 on the golden set). One bounded LLM call
+# that reads the question against the candidate NCD *titles* corrects the primary pick
+# (top-1 ~0.92) and picks a single governing policy, so it lifts ncd_recall AND drops
+# contamination — neither a looser threshold nor a hierarchy rule could do both
+# (see scripts/sweep_second_frac.py, backtest_scope_select.py, backtest_disambig.py).
+_DISAMBIG_MARGIN = 0.40   # fire only when runner-up score >= MARGIN * top score
+_DISAMBIG_TOP_N = 4       # candidates shown to the LLM
+_DISAMBIG_SYS = (
+    "You identify which Medicare National Coverage Determination(s) govern a coverage "
+    "question. You are given the question and a short list of candidate NCDs (number + "
+    "title). Return ONLY the NCD number(s) whose policy actually governs the question, "
+    "as a JSON list of strings. Prefer a SINGLE NCD. Return two ONLY when the question "
+    "genuinely spans a policy and its sub-policy (e.g. a procedure NCD plus its testing/"
+    "device sub-NCD). Never return more than two. Use only numbers from the candidate "
+    'list. Example: ["240.4"] or ["240.4","240.4.1"].'
+)
+
+
+def _disambiguate_ncds(question: str, candidates: list[tuple[str, str]]) -> list[str]:
+    """Ask the LLM which of the candidate NCDs (number, title) govern the question.
+
+    Returns up to two NCD numbers drawn from the candidate list. Raises on hard
+    (non-retryable) errors so the caller can fall back to deterministic selection.
+    """
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+    listing = "\n".join(f"- {n}: {t}" for n, t in candidates)
+    prompt = (
+        f"{_DISAMBIG_SYS}\n\nQUESTION: {question}\n\n"
+        f"CANDIDATES:\n{listing}\n\nGoverning NCD number(s) as JSON:"
+    )
+    txt = ""
+    for attempt in range(6):
+        try:
+            txt = llm.invoke(prompt).content
+            break
+        except Exception as exc:
+            if attempt == 5 or not _retryable(exc):
+                raise
+            delay = _parse_retry_delay(exc)
+            wait = (delay + random.uniform(1, 3)) if delay else min(2 ** attempt * 5 + 1, 60)
+            logger.warning("NCD disambiguation rate limited — waiting %.0fs", wait)
+            time.sleep(wait)
+    valid = {n for n, _ in candidates}
+    out: list[str] = []
+    for n in re.findall(r"\d+(?:\.\d+)+", txt):
+        if n in valid and n not in out:
+            out.append(n)
+        if len(out) == 2:
+            break
+    return out
+
+
 def _select_primary_ncds(
-    scored: list[tuple[float, Document]], second_frac: float = 0.7
+    scored: list[tuple[float, Document]],
+    second_frac: float = 0.7,
+    question: str | None = None,
 ) -> list[str]:
     """Collapse reranked NCD chunks to the primary NCD by score-weighted vote.
 
     Sum each NCD's reranker relevance (sigmoid of the cross-encoder logit, so the
     threshold is meaningful and stray negative-scored chunks don't dominate) across
-    the reranked chunks, and pick the top NCD. A SECOND NCD is included only when its
-    aggregate score is within `second_frac` of the top — the rare case of genuine
-    co-governance (a general NCD + a sub-NCD). Otherwise gap analysis reasons over a
-    single policy, which both restores the criteria text and drops weakly-relevant
-    stray NCDs that would otherwise contaminate the verdict.
+    the reranked chunks, and pick the top NCD. When `question` is given and the top
+    NCDs score close, defer to an LLM disambiguation step (it reads titles vs the
+    question and reliably out-picks the score argmax). Otherwise — and on any
+    disambiguation failure — fall back to the deterministic rule: a SECOND NCD is
+    added only when its aggregate score is within `second_frac` of the top (the rare
+    case of genuine co-governance, a general NCD + a sub-NCD).
     """
     agg: dict[str, float] = {}
+    titles: dict[str, str] = {}
     for score, d in scored:
         n = d.metadata.get("policy_number")
         if not n:
             continue
         agg[n] = agg.get(n, 0.0) + 1.0 / (1.0 + math.exp(-score))
+        titles.setdefault(n, d.metadata.get("title") or "")
     if not agg:
         return []
     ranked = sorted(agg.items(), key=lambda x: x[1], reverse=True)
     top_n, top_s = ranked[0]
+
+    # Ambiguous (top NCDs close): let the LLM pick which policy governs.
+    if question and len(ranked) > 1 and top_s > 0 and ranked[1][1] >= _DISAMBIG_MARGIN * top_s:
+        cands = [(n, titles.get(n, "")) for n, _ in ranked[:_DISAMBIG_TOP_N]]
+        try:
+            picked = _disambiguate_ncds(question, cands)
+            if picked:
+                return picked
+        except Exception:
+            logger.warning("NCD disambiguation failed; using deterministic selection", exc_info=True)
+
     chosen = [top_n]
-    # Add at most ONE more NCD — the runner-up, and only if it's within second_frac of
-    # the top. Capping at two is deliberate: when many NCDs score similarly the result
-    # is an ambiguous query, not genuine co-governance, and pulling 3-5 full policies in
-    # would reintroduce exactly the cross-policy contamination this design removes.
+    # Deterministic fallback: add at most ONE runner-up, only if within second_frac of
+    # the top. Capping at two is deliberate — many similar scores mean an ambiguous
+    # query, not co-governance, and pulling 3-5 full policies in would reintroduce the
+    # cross-policy contamination this design removes.
     if len(ranked) > 1:
         runner_n, runner_s = ranked[1]
         if top_s > 0 and runner_s >= second_frac * top_s:
@@ -474,7 +543,7 @@ def gap_analysis(
         _hybrid_retrieve_ncd(question, k_),
         top_n=PIPELINE_CONFIG["reranker_top_n"],
     )
-    primary_ncds = _select_primary_ncds(reranked)
+    primary_ncds = _select_primary_ncds(reranked, question=question)
 
     if primary_ncds:
         # Whole-NCD context: a coverage determination is one document, so supply the
