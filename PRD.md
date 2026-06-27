@@ -25,6 +25,7 @@
 | v2.2 | 2026-06-13 | **Gap eval run + hardening.** 284-record reference fully Claude-adjudicated (67 overrides/24%). Fixed name-collision bug (topical join pulled same-name-different-thing abstracts) via disambiguation in `_GAP_SYSTEM`/`_LABEL_PROMPT`; `LABEL_MODEL` flash-lite→flash. Captured PubMed PublicationType for grounded Evidence Grade. First 40-sample eval then two fixes: topic-forward question regen (`ncd_recall` 0.75→0.925) and `pubmed_k` 8→12 to match the labeler's evidence budget (conservatism halved); `alignment_accuracy` 0.325→0.45, citation_precision 1.0, 0 catastrophic flips. Streamlit model-load crash fixed (disable HF tqdm bars). |
 | v2.1 | 2026-06-11 | **Phase 2 gap analysis implemented** (`phase-2` branch). `gap_analysis()` in pipeline.py: NCD-only hybrid retrieval + rerank (policy side) joined to PubMed evidence via **topical join** (abstracts filtered by `source_ncd_number == policy_number`, so evidence and policy describe the same intervention; empty join → "Insufficient Evidence" rather than unrelated abstracts). PubMed side: dense top-`pubmed_k`(8), no cross-encoder (bge-reranker not trained on clinical text), sorted newest-first. UI auto-routes policy vs gap queries via regex signal scoring (no mode toggle). Fixed PubMed date parser (ElementTree childless-element falsy bug left 99% of years blank); re-fetched → 2457 abstracts, 0% empty years. Gap eval: `generate_golden_gap.py` (independent `gemini-2.5-flash-lite` labeler reads raw NCD + abstracts — breaks circular self-grading; Groq question cache + rate-limit backoff) and `judge_gap.py` (retrieval-gated `alignment_accuracy`, `alignment_label_match`, `ncd_recall`, `pmid_recall`, `citation_precision`, faithfulness over policy+pubmed). Interaction/feedback logging extended with `mode`, `alignment`, and PubMed sources. |
 | v2.3 | 2026-06-17 | **Primary-evidence re-ingest + whole-NCD gap context + full 277-record eval.** (1) Re-fetched PubMed with a two-pass primary-evidence filter (RCT/meta-analysis/systematic-review/cohort first, unrestricted backfill) + MeSH study-type fallback → **3,219 abstracts / 296 topics**, ~89% primary evidence (was ~75% review/background). (2) Tier-aware grading (T1–T5 + background/unspecified) threaded through `fetch_pubmed.evidence_tier`, the labeler, and `_GAP_SYSTEM`. (3) Re-labeled + Claude-adjudicated golden set → **277 records** (excluded 280.2 white-cane & 80.7 refractive-keratoplasty as non-medical/statutory; 18 v2 adjudications fixing over-called Coverage-Gap/Overcoverage). (4) Added `pmid_recall_retrieved` (citation recall over *retrieved* reference PMIDs — isolates citation behavior from the labeler-vs-pipeline retrieval-mechanism mismatch; 0.637→0.740 on the same answers) + seeded-random faithfulness subsampling. (5) Sharpened the Partial-vs-Aligned boundary (positive test: policy has explicit eligibility criteria AND evidence supports an excluded-but-eligible population); **reverted** an Insufficient-gate loosening that net-regressed on a 125-record check. (6) **Whole-NCD gap context** — chunk retrieval now only *identifies* the governing NCD via a score-weighted vote (sigmoid-of-logit; runner-up added only if within 70% of top; **capped at 2**), then feeds the full NCD text and scopes evidence to it. Fixes Partial gaps lost when the criteria chunk fell outside the top-5 (e.g. 240.4 CPAP Aligned→Partial). NCD-selection backtest (n=277): primary top-1 **0.830**, expected-in-selected **0.892**. A heuristic CED/admin boilerplate filter was prototyped and **rejected** (reliably regressed CPAP). Full gap eval re-run under whole-NCD context deferred (cost). |
+| v2.4 | 2026-06-25 | **Whole-NCD gap eval completed** (the v2.3 deferred run). Full 277-record re-run under whole-NCD context (faithfulness on 22 random samples) vs old top-5-chunk baseline: `alignment_accuracy` 0.570→**0.542**, `alignment_kappa` 0.346→**0.433**, `faithfulness` 0.597→**0.705**, `ncd_recall` 0.942→**0.888**, **Partial** label_match 0.20→**0.33**. Verdict: a *trade, not a win* — accuracy regressed but the loss is **entirely** the capped NCD-selection's `ncd_recall` drop, not reasoning (which improved on kappa/faithfulness/Partial). Recommendation logged: keep full-text policy context, loosen the NCD-selection cap/`second_frac` to recover `ncd_recall`. See §15.2.3. Also: re-ingest DB committed + orphan segments pruned; doc fix — labeler is `gemini-2.5-flash` (not flash-lite). |
 
 ---
 
@@ -279,7 +280,7 @@ Same provider organization, same RCM / UM team, often the same patient — **pre
 
 Breaking the circularity: an early version graded the pipeline against labels produced by *running the pipeline itself* — measuring reproducibility, not correctness. The reference labels are now produced by an **independent judge**.
 
-- **`generate_golden_gap.py`** — for each NCD with abstracts: (1) Groq `llama-3.1-8b-instant` writes one evidence-seeking question (cached in `data/gap_questions.json`, rate-limit backoff); (2) an **independent `gemini-2.5-flash-lite` labeler** reads the *raw* NCD text + that NCD's abstracts (never the pipeline's report) and emits `reference_alignment`, `reference_pmids`, rationale → `data/golden_gap.json`. Different model tier + different prompt + raw evidence = labels independent of the pipeline's generation.
+- **`generate_golden_gap.py`** — for each NCD with abstracts: (1) Groq `llama-3.1-8b-instant` writes one evidence-seeking question (cached in `data/gap_questions.json`, rate-limit backoff); (2) an **independent `gemini-2.5-flash` labeler** reads the *raw* NCD text + that NCD's abstracts (never the pipeline's report) and emits `reference_alignment`, `reference_pmids`, rationale → `data/golden_gap.json`. Different prompt + raw evidence + cross-vendor Claude adjudication = labels independent of the pipeline's generation. (Upgraded from flash-lite, which could not reliably resolve name-collisions in the topical join.)
 - **`judge_gap.py`** — runs `gap_analysis()` per question (answers cached by config) and scores it against the independent reference.
 
 ### 15.2 Metrics
@@ -348,7 +349,27 @@ Per-label diagnosis (label_match): Aligned 0.71, Insufficient 0.66, Coverage Gap
 
 **Rejected:** a heuristic CED/admin boilerplate filter (drop research-protocol chunks from the whole-NCD context) — it reliably regressed CPAP Partial→Aligned across 4 runs despite retaining the criteria chunk, so it was reverted. Verdicts are context-composition-sensitive; any content trimming must be section-aware and eval-validated, not heuristic.
 
-**Pending:** a full 277-record gap-eval re-run *under* the whole-NCD context (deferred for cost) to quantify the Partial-recovery lift end-to-end; so far validated only by spot-checks + the NCD-selection backtest.
+### 15.2.3 Full 277-record run *under* whole-NCD context (2026-06-25, v2.4)
+
+The deferred re-run is done — full 277 records regenerated under the whole-NCD pipeline (faithfulness on 22 random samples). Head-to-head vs the old top-5-chunk full-277 baseline:
+
+| Metric | Old top-5-chunk | Whole-NCD | Δ |
+|---|:---:|:---:|:---:|
+| `alignment_accuracy` | **0.570** | 0.542 | 🔴 −0.028 |
+| `alignment_label_match` | **0.581** | 0.570 | 🔴 −0.011 |
+| `alignment_action_match` | 0.621 | 0.621 | ⚪ 0.000 |
+| `alignment_kappa` | 0.346 | **0.433** | 🟢 +0.087 |
+| `ncd_recall` | **0.942** | 0.888 | 🔴 −0.054 |
+| `pmid_recall` | 0.637 | 0.633 | ⚪ −0.004 |
+| `pmid_recall_retrieved` | 0.740 | 0.725 | ⚪ −0.015 |
+| `citation_precision` | 0.998 | 0.994 | ⚪ −0.004 |
+| `faithfulness` (random) | 0.597 (n=15) | **0.705** (n=22) | 🟢 +0.108 |
+
+Per-label `label_match` (old→new): Aligned 0.71→0.60, Insufficient 0.66→0.70, Coverage Gap 0.67→**0.83**, Overcoverage 0.30→0.30, **Partial 0.20→0.33**.
+
+**Verdict — a trade, not a win.** Headline `alignment_accuracy` *regressed* (0.570→0.542), but the drop is **entirely a retrieval regression, not reasoning**: since `accuracy = label_match ∧ ncd_recall` and label_match held, the loss tracks `ncd_recall` (0.942→0.888) — the score-weighted **capped-at-2 NCD selection** surfaces the governing NCD less often than the old "any NCD in the top-5 chunks." Reasoning quality *improved*: kappa +0.087 (better evidence-vs-coverage *direction*), faithfulness +0.108 (full policy text → less fabrication), Coverage Gap +0.16, and Partial finally off the floor (0.20→0.33). But Partial's gain came at **Aligned's expense** (0.71→0.60, ≈+7 Partial / −14 Aligned) — the Partial/Aligned boundary *moved*, it didn't *sharpen*.
+
+**Recommendation.** Whole-NCD bundled two changes: (1) full-text policy context — clearly good (kappa, faithfulness, Partial all up); (2) capped score-weighted NCD selection — clearly costly (`ncd_recall` −0.054). **Keep (1), fix (2):** loosen the NCD-selection cap / raise `second_frac` to recover `ncd_recall` and lift accuracy back above 0.570 *while keeping* the kappa/faithfulness gains. Then treat the Aligned↔Partial boundary as a separate, focused problem.
 
 ### 15.3 Roadmap
 
@@ -356,7 +377,7 @@ Per-label diagnosis (label_match): Aligned 0.71, Insufficient 0.66, Coverage Gap
 |---|---|
 | PubMed ingestion + indexing | ✅ Done (2,457 abstracts) |
 | Topical-join retrieval + gap synthesis | ✅ Done |
-| Independent gap eval (golden set + judge) | ✅ Done — first full 277-record run complete (v2.3); re-run under whole-NCD context + human validation pending |
+| Independent gap eval (golden set + judge) | ✅ Done — full 277-record run complete under both top-5-chunk (v2.3) and whole-NCD (v2.4) pipelines; human validation pending |
 | Full LCD jurisdiction implementation | Planned |
 | Expert validation (20 gap reports/month) | Planned |
 | Fine-tuning on gap assessments | Planned |

@@ -126,12 +126,13 @@ Beyond "what does CMS cover?", the agent answers "where is CMS coverage out of s
 <details>
 <summary><strong>Gap evaluation (independent judge)</strong></summary>
 
-Reference labels come from an **independent `gemini-2.5-flash-lite` judge** that reads the raw NCD + abstracts — never the pipeline's own report — so the eval isn't graded against itself.
+Reference labels come from an **independent `gemini-2.5-flash` judge** that reads the raw NCD + abstracts — never the pipeline's own report — so the eval isn't graded against itself; labels are additionally cross-vendor adjudicated by Claude.
 
 | Metric | Measures |
 |---|---|
 | `alignment_accuracy` | End-to-end: right alignment **and** right NCD retrieved |
 | `alignment_label_match` | Diagnostic: raw label agreement (retrieval-blind) |
+| `alignment_kappa` | Quadratic-weighted Cohen's κ on the evidence-vs-coverage direction |
 | `ncd_recall` | Expected NCD surfaced by retrieval |
 | `pmid_recall` | Fraction of key reference PMIDs cited |
 | `pmid_recall_retrieved` | Citation recall over reference PMIDs actually retrieved (isolates citation behavior from the retrieval-mechanism mismatch) |
@@ -139,6 +140,20 @@ Reference labels come from an **independent `gemini-2.5-flash-lite` judge** that
 | `faithfulness` | RAGAS faithfulness vs policy + PubMed contexts |
 
 `alignment_accuracy = label_match ∧ ncd_recall`, so the metrics decompose failures into retrieval vs reasoning.
+
+**Results (full 277-record golden set).** Two pipeline variants measured end-to-end:
+
+| Metric | Top-5-chunk | Whole-NCD |
+|---|:---:|:---:|
+| `alignment_accuracy` | **0.570** | 0.542 |
+| `alignment_label_match` | 0.581 | 0.570 |
+| `alignment_kappa` | 0.346 | **0.433** |
+| `ncd_recall` | **0.942** | 0.888 |
+| `pmid_recall` | 0.637 | 0.633 |
+| `citation_precision` | 0.998 | 0.994 |
+| `faithfulness` (random subsample) | 0.597 | **0.705** |
+
+The whole-NCD variant feeds the governing NCD's full text (better grounding → higher kappa/faithfulness, and recovers `Partial Coverage Gap` label_match 0.20→0.33), but its capped NCD-selection lowers `ncd_recall`, so end-to-end accuracy is a wash. Net: a *trade, not a win* — see PRD §15.2.3.
 
 ```bash
 python -m src.ingestion.fetch_pubmed         # fetch PubMed abstracts
