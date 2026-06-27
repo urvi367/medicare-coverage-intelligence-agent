@@ -8,7 +8,6 @@ file). Structural metrics only (faithfulness skipped — fast/cheap check).
 import collections
 import json
 import random
-import shutil
 from pathlib import Path
 
 SEED, N = 42, 25
@@ -47,9 +46,10 @@ def main():
         CACHE.unlink()
         print("cleared stale answer cache", flush=True)
 
-    # 4) run NEW pipeline on the seeded-25
+    # 4) run NEW pipeline on the seeded-25 (metrics recomputed from the samples
+    #    file below for the paired comparison; the returned aggregate is unused)
     from src.evaluation.judge_gap import evaluate
-    new_scores = evaluate(n_samples=N, sample_seed=SEED, faithfulness_max=0)
+    evaluate(n_samples=N, sample_seed=SEED, faithfulness_max=0)
 
     # 5) load NEW per-record samples and pair with OLD on the same questions
     new = {r["question"]: r for r in json.loads(SAMPLES.read_text(encoding="utf-8"))}

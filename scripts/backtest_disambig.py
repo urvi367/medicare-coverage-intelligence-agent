@@ -14,7 +14,6 @@ Metric defs match the other backtests: top1 / recall (expected-in-selected) /
 multi% (two NCDs selected) and llm_calls.
 """
 import json
-import math
 import re
 import sys
 import time
