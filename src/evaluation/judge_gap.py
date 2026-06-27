@@ -101,7 +101,11 @@ def _quadratic_weighted_kappa(pairs: list[tuple[str, str]]) -> float | None:
     return round(1 - num / den, 3) if den else None
 
 
-def evaluate(n_samples: int | None = None, faithfulness_max: int | None = None) -> dict[str, Any]:
+def evaluate(
+    n_samples: int | None = None,
+    faithfulness_max: int | None = None,
+    sample_seed: int | None = None,
+) -> dict[str, Any]:
     """Run gap analysis eval against the golden gap dataset.
 
     Args:
@@ -109,6 +113,8 @@ def evaluate(n_samples: int | None = None, faithfulness_max: int | None = None) 
         faithfulness_max: Cap RAGAS faithfulness to this many samples (None = all).
             Faithfulness is ~60s/sample (slow); the structural metrics are computed
             over every sample regardless, so cap this to keep large runs tractable.
+        sample_seed: If set, take a SEEDED-RANDOM subset of n_samples instead of the
+            first n_samples (representative mid-size runs rather than the head slice).
 
     Returns:
         Dict of metric name → score.
@@ -128,7 +134,10 @@ def evaluate(n_samples: int | None = None, faithfulness_max: int | None = None) 
         )
     golden = json.loads(GOLDEN_GAP_PATH.read_text(encoding="utf-8"))
     if n_samples:
-        golden = golden[:n_samples]
+        if sample_seed is not None:
+            golden = random.Random(sample_seed).sample(golden, min(n_samples, len(golden)))
+        else:
+            golden = golden[:n_samples]
     logger.info("Evaluating on %d gap golden records", len(golden))
 
     cache_path = _gap_cache_path()
