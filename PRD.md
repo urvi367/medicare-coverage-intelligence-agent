@@ -26,6 +26,7 @@
 | v2.1 | 2026-06-11 | **Phase 2 gap analysis implemented** (`phase-2` branch). `gap_analysis()` in pipeline.py: NCD-only hybrid retrieval + rerank (policy side) joined to PubMed evidence via **topical join** (abstracts filtered by `source_ncd_number == policy_number`, so evidence and policy describe the same intervention; empty join → "Insufficient Evidence" rather than unrelated abstracts). PubMed side: dense top-`pubmed_k`(8), no cross-encoder (bge-reranker not trained on clinical text), sorted newest-first. UI auto-routes policy vs gap queries via regex signal scoring (no mode toggle). Fixed PubMed date parser (ElementTree childless-element falsy bug left 99% of years blank); re-fetched → 2457 abstracts, 0% empty years. Gap eval: `generate_golden_gap.py` (independent `gemini-2.5-flash-lite` labeler reads raw NCD + abstracts — breaks circular self-grading; Groq question cache + rate-limit backoff) and `judge_gap.py` (retrieval-gated `alignment_accuracy`, `alignment_label_match`, `ncd_recall`, `pmid_recall`, `citation_precision`, faithfulness over policy+pubmed). Interaction/feedback logging extended with `mode`, `alignment`, and PubMed sources. |
 | v2.3 | 2026-06-17 | **Primary-evidence re-ingest + whole-NCD gap context + full 277-record eval.** (1) Re-fetched PubMed with a two-pass primary-evidence filter (RCT/meta-analysis/systematic-review/cohort first, unrestricted backfill) + MeSH study-type fallback → **3,219 abstracts / 296 topics**, ~89% primary evidence (was ~75% review/background). (2) Tier-aware grading (T1–T5 + background/unspecified) threaded through `fetch_pubmed.evidence_tier`, the labeler, and `_GAP_SYSTEM`. (3) Re-labeled + Claude-adjudicated golden set → **277 records** (excluded 280.2 white-cane & 80.7 refractive-keratoplasty as non-medical/statutory; 18 v2 adjudications fixing over-called Coverage-Gap/Overcoverage). (4) Added `pmid_recall_retrieved` (citation recall over *retrieved* reference PMIDs — isolates citation behavior from the labeler-vs-pipeline retrieval-mechanism mismatch; 0.637→0.740 on the same answers) + seeded-random faithfulness subsampling. (5) Sharpened the Partial-vs-Aligned boundary (positive test: policy has explicit eligibility criteria AND evidence supports an excluded-but-eligible population); **reverted** an Insufficient-gate loosening that net-regressed on a 125-record check. (6) **Whole-NCD gap context** — chunk retrieval now only *identifies* the governing NCD via a score-weighted vote (sigmoid-of-logit; runner-up added only if within 70% of top; **capped at 2**), then feeds the full NCD text and scopes evidence to it. Fixes Partial gaps lost when the criteria chunk fell outside the top-5 (e.g. 240.4 CPAP Aligned→Partial). NCD-selection backtest (n=277): primary top-1 **0.830**, expected-in-selected **0.892**. A heuristic CED/admin boilerplate filter was prototyped and **rejected** (reliably regressed CPAP). |
 | v2.4 | 2026-06-25 | **Whole-NCD gap eval completed**. Full 277-record re-run under whole-NCD context (faithfulness on 22 random samples) vs old top-5-chunk baseline: `alignment_accuracy` 0.570→**0.542**, `alignment_kappa` 0.346→**0.433**, `faithfulness` 0.597→**0.705**, `ncd_recall` 0.942→**0.888**, **Partial** label_match 0.20→**0.33**. Verdict: a *trade, not a win* — accuracy regressed but the loss is **entirely** the capped NCD-selection's `ncd_recall` drop, not reasoning (which improved on kappa/faithfulness/Partial). Recommendation logged: keep full-text policy context, loosen the NCD-selection cap/`second_frac` to recover `ncd_recall` — *superseded in v2.5*. See §15.2.2. Also: re-ingest DB committed + orphan segments pruned; doc fix — labeler is `gemini-2.5-flash` (not flash-lite). |
+| v3.0 | 2026-06-27 | **Phase 3 kickoff — dynamic LCD lookup as agentic tool use** (branch `phase-3`). See §16. LCDs resolved at query time (NCD-governs? → resolve MAC for the beneficiary's state → fetch the live LCD → classify); routing decisions deterministic, orchestration agentic. Scoped to 5 MACs (Noridian/CGS/WPS/Palmetto/NGS). Spike: CMS LCD list endpoint ignores all server-side filters (~969 LCDs, filter by contractor locally + on-demand detail fetch). Step 1 shipped: `src/lcd/jurisdiction.py` (state→MAC, `extract_state`, `resolve_mac`, `ncd_disposition`); `data/lcd_raw.json` pruned 500→487. |
 | v2.5 | 2026-06-27 | **Selection-tuning ruled out; disambiguation step is the lever.** Two LLM-free backtests (cap held at 2): (a) `second_frac` sweep — recall ceiling **0.924** at frac=0 (< old 0.942; ~1.8pts of expected NCDs never enter the top-2 rank), recall↔contamination locked ~1:8, and 0.924×0.61 ≈ 0.564 < 0.570 by arithmetic; (b) scope-aware selection (admit runner-up iff hierarchically related) — of 26 runner-up=expected cases only **3 are related / 23 unrelated**, so scope-only cuts `multi%` 26→6.5 but *regresses* recall 0.888→0.841. Neither threshold nor structure decouples recall from contamination — the signal is **semantic, not numeric**. Next lever: a narrow upstream disambiguation step (one bounded LLM call: which NCD governs?). Added `scripts/sweep_second_frac.py` (cap-2) + `scripts/backtest_scope_select.py`. |
 
 ---
@@ -370,7 +371,7 @@ Neither threshold nor structure decouples recall from contamination. The remaini
 | PubMed ingestion + indexing | ✅ Done (2,457 abstracts) |
 | Topical-join retrieval + gap synthesis | ✅ Done |
 | Independent gap eval (golden set + judge) | ✅ Done — full 277-record run complete under both top-5-chunk (v2.3) and whole-NCD (v2.4) pipelines; human validation pending |
-| Full LCD jurisdiction implementation | Planned |
+| Full LCD jurisdiction implementation | 🔨 In progress — **Phase 3** (dynamic LCD lookup as tool use) |
 | Expert validation (20 gap reports/month) | Planned |
 | Fine-tuning on gap assessments | Planned |
 
@@ -378,4 +379,33 @@ Neither threshold nor structure decouples recall from contamination. The remaini
 
 ---
 
-*Medicare Coverage Intelligence Platform · PRD v2.3 · All data sources public · Last updated 2026-06-17*
+## 16. Phase 3 — Dynamic LCD Lookup (agentic tool use)
+
+**Thesis.** LCDs are jurisdictional and too numerous to pre-index sensibly (one CMS list call returns ~969 final LCDs, the *same* service has different LCDs across MACs, and the relevant one depends on the beneficiary's state). So coverage must be resolved at query time. This is the one place agentic orchestration earns its keep — a capability static RAG structurally cannot have.
+
+**Control flow** (branch `phase-3`):
+
+```
+query (+ optional state)
+  → NCD-resolver  ── governs ─▶ classify with NCD (reuse Phase-2 pipeline)   ✅
+       │ (deterministic: disambiguation + defer-marker check)
+       └─ silent / defers-to-MAC
+            → resolve MAC for the state   (deterministic table; ask the user
+            │   for their state if the query has none)
+            → TOOL lcd_lookup(mac, service)   (dynamic CMS API call)
+                 ├─ hit(s) → classify against the live LCD(s)
+                 ├─ empty  → "no LCD → contractor discretion / individual consideration"
+                 └─ error  → degrade gracefully, report (no fabrication)
+```
+
+**Deterministic vs agentic boundary (by design).** Every routing *decision* stays deterministic — `ncd_disposition` (governs/defers/silent via a high-precision defer-marker regex), `extract_state`, `resolve_mac`. The **agentic** part is orchestrating *when* to call which tool, plus reconciling multiple LCDs and handling empty/error/fallback.
+
+**Scope.** Five MAC jurisdictions end-to-end — **Noridian, CGS, WPS, Palmetto, National Government Services** (the best-represented; 487/500 snapshot LCDs). States served by First Coast and Novitas are out of scope and resolve to *unsupported jurisdiction* (reported, not guessed).
+
+**Spike finding (CMS Coverage API).** The LCD list endpoint `reports/local-coverage-final-lcds` **ignores all server-side filters** (keyword/state/contractor/q/search are no-ops) and returns ~969 LCDs in one call; no by-state/search endpoint exists. LCDs carry no state field, only `contractor_name_type`. So `lcd_lookup` = fetch the list once (cacheable) → filter by contractor locally → fetch full text on demand via the license-token-gated detail endpoint.
+
+**Status.** *Step 1 done* — `src/lcd/jurisdiction.py` (state→MAC table for the 5 MACs, `extract_state`, `resolve_mac`, `ncd_disposition`; 15/344 NCDs detected as genuine MAC hand-offs). `data/lcd_raw.json` pruned 500→487. *Next:* (2) `lcd_lookup` tool against the live API with empty/error fallback; (3) the Gemini function-calling orchestration loop; (4) a jurisdictional eval set (service × state → expected LCD/disposition). The `cms_coverage` index still holds the old LCD set — rebuild when the dynamic path lands.
+
+---
+
+*Medicare Coverage Intelligence Platform · PRD v3.0 (Phase 3 in progress) · All data sources public · Last updated 2026-06-27*
