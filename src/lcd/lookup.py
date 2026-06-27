@@ -19,8 +19,10 @@ Contract for the agentic loop:
 from __future__ import annotations
 
 import logging
-import re
+import math
 from dataclasses import dataclass
+
+import numpy as np
 
 from src.ingestion.fetch import (
     _fetch_lcd_detail,
@@ -28,6 +30,7 @@ from src.ingestion.fetch import (
     _paginate,
     _strip_html,
 )
+from src.rag.pipeline import _get_reranker
 
 logger = logging.getLogger(__name__)
 
@@ -36,15 +39,12 @@ _TEXT_FIELDS = (
     "indications_limitations", "indications_limitations_text",
     "indication", "coverage_guidance", "summary_of_evidence",
 )
-# query/title noise to drop before token-overlap scoring
-_STOP = {
-    "for", "the", "of", "and", "in", "a", "an", "to", "is", "are", "does", "do",
-    "covered", "cover", "coverage", "medicare", "evidence", "support", "supports",
-    "patient", "patients", "use", "used", "using", "with", "this", "that", "service",
-    "show", "what", "there", "any", "my", "their", "treatment", "therapy",
-}
+_SHORTLIST_K = 10  # bi-encoder cosine shortlist before cross-encoder scoring
 
 _list_cache: list[dict] | None = None
+_embedder = None
+# per-MAC cache of (titles, normalized title-embedding matrix)
+_title_emb_cache: dict[str, tuple[list[str], np.ndarray]] = {}
 
 
 class LcdLookupError(RuntimeError):
@@ -63,15 +63,37 @@ def _lcd_list() -> list[dict]:
     return _list_cache
 
 
-def _tokens(text: str) -> set[str]:
-    return {t for t in re.findall(r"[a-z0-9]+", text.lower()) if len(t) > 2 and t not in _STOP}
+def _get_embedder():
+    global _embedder
+    if _embedder is None:
+        from src.rag.embedder import get_embeddings
+        _embedder = get_embeddings()
+    return _embedder
 
 
-def _match_score(service_tokens: set[str], title: str) -> float:
-    """Fraction of the service's content tokens present in the LCD title."""
-    if not service_tokens:
-        return 0.0
-    return len(service_tokens & _tokens(title)) / len(service_tokens)
+def _rank_candidates(service: str, mac: str, items: list[dict]) -> list[tuple[float, dict]]:
+    """Two-stage rank: bi-encoder cosine shortlist → cross-encoder relevance score.
+
+    Returns (cross_encoder_sigmoid, item) pairs, highest first. The bi-encoder
+    embeddings are normalized so a dot product is cosine; the cross-encoder then
+    decides relevance (it separates on-topic from tangential far more cleanly than
+    the bi-encoder's high cosine floor).
+    """
+    emb = _get_embedder()
+    titles = [x.get("title", "") for x in items]
+    key = f"{mac}|{len(titles)}"
+    if key not in _title_emb_cache:
+        _title_emb_cache[key] = (titles, np.asarray(emb.embed_documents(titles)))
+    _, mat = _title_emb_cache[key]
+    qv = np.asarray(emb.embed_query(service))
+    cos = mat @ qv
+    shortlist = np.argsort(-cos)[:_SHORTLIST_K]
+
+    pairs = [(service, titles[i]) for i in shortlist]
+    logits = _get_reranker().predict(pairs)
+    scored = [(1.0 / (1.0 + math.exp(-float(l))), items[i]) for l, i in zip(logits, shortlist)]
+    scored.sort(key=lambda p: p[0], reverse=True)
+    return scored
 
 
 @dataclass
@@ -79,7 +101,7 @@ class LcdMatch:
     lcd_id: str        # display id, e.g. "L33610"
     title: str
     contractor: str    # first contractor line of contractor_name_type
-    score: float
+    score: float       # cross-encoder relevance (sigmoid, 0–1)
     text: str          # full indications/limitations text (HTML-stripped)
 
 
@@ -87,7 +109,7 @@ def lcd_lookup(
     mac: str,
     service: str,
     max_results: int = 3,
-    min_score: float = 0.34,
+    min_score: float = 0.575,
 ) -> list[LcdMatch]:
     """Return up to `max_results` of this MAC's LCDs matching `service`, with full text.
 
@@ -95,7 +117,10 @@ def lcd_lookup(
         mac: MAC contractor name (as in `contractor_name_type`), e.g. from resolve_mac().
         service: clean clinical-service description (e.g. "intravenous immune globulin").
         max_results: cap on LCDs returned.
-        min_score: minimum title token-overlap (0–1) for a candidate to count.
+        min_score: minimum cross-encoder relevance (sigmoid, 0–1) for a candidate to
+            count. 0.575 separates on-topic LCDs (≥0.597) from tangential ones (≤0.554)
+            on the bge-reranker; a wrong LCD is worse than a "verify" fallback, so the
+            threshold leans against false positives. Expects a clean service term.
 
     Returns [] when no LCD matches in this jurisdiction. Raises LcdLookupError on a
     list/token/network failure.
@@ -116,15 +141,11 @@ def lcd_lookup(
         logger.info("No LCDs for MAC %r", mac)
         return []
 
-    stoks = _tokens(service)
-    ranked = sorted(
-        ((_match_score(stoks, x.get("title", "")), x) for x in mac_items),
-        key=lambda p: p[0],
-        reverse=True,
-    )
+    ranked = _rank_candidates(service, mac, mac_items)
     top = [(s, x) for s, x in ranked if s >= min_score][:max_results]
     if not top:
-        logger.info("No LCD title match for service %r under MAC %r", service, mac)
+        logger.info("No relevant LCD for service %r under MAC %r (best %.3f)",
+                    service, mac, ranked[0][0] if ranked else 0.0)
         return []
 
     try:
