@@ -153,7 +153,7 @@ Reference labels come from an **independent `gemini-2.5-flash` judge** that read
 | `citation_precision` | 0.998 | 0.994 |
 | `faithfulness` (random subsample) | 0.597 | **0.705** |
 
-The whole-NCD variant feeds the governing NCD's full text (better grounding → higher kappa/faithfulness, and recovers `Partial Coverage Gap` label_match 0.20→0.33), but its capped NCD-selection lowers `ncd_recall`, so end-to-end accuracy is a wash. Net: a *trade, not a win* — see PRD §15.2.3.
+The whole-NCD variant feeds the governing NCD's full text (better grounding → higher kappa/faithfulness, and recovers `Partial Coverage Gap` label_match 0.20→0.33), but its capped NCD-selection lowers `ncd_recall`, so end-to-end accuracy is a wash. Net: a *trade, not a win* — see PRD §15.2.2.
 
 ```bash
 python -m src.ingestion.fetch_pubmed         # fetch PubMed abstracts
