@@ -1,99 +1,93 @@
-# Medicare Coverage Intelligence Agent
+# Medicare Coverage Intelligence Platform
 
-A RAG system that answers natural-language questions about Medicare coverage policy by retrieving directly from CMS National Coverage Determinations (NCDs) and Local Coverage Determinations (LCDs). Answers are grounded, cited, and evaluated end-to-end.
+A retrieval system over CMS coverage policy and the clinical literature that answers two questions for provider revenue-cycle teams:
 
-Built for **provider-side prior-authorization and denial-prevention staff** who need to confirm Medicare coverage criteria *before* submitting a request — preventing denials at submission time.
+1. **"What does Medicare cover, and under what criteria?"** — grounded, cited answers from CMS National and Local Coverage Determinations (NCDs/LCDs), for **denial *prevention*** at prior-auth time.
+2. **"Where is CMS coverage out of step with the published evidence?"** — a structured, PMID-cited gap report comparing each NCD against PubMed, for **denial *appeals*** ("not medically necessary" / "experimental").
+
+The UI auto-routes each question to the right path by regex signal scoring — no manual mode toggle.
 
 Prototype: https://medicare-coverage-agent.streamlit.app/
+
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        CMS Coverage API                         │
-│          api.coverage.cms.gov/v1  (NCDs + LCDs)                 │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │  fetch_and_save() — parallel HTTP
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     Ingestion Layer                             │
-│  • Iterative HTML unescape (fixes CMS double-escaping)          │
-│  • 8-worker ThreadPoolExecutor for parallel detail fetching     │
-│  • Saved to data/ncd_raw.json, data/lcd_raw.json               │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │  load_documents()
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     Indexing Layer                              │
-│  • RecursiveCharacterTextSplitter (800 chars / 100 overlap)     │
-│  • Blank chunk filter — no empty vectors in index               │
-│  • Title prepend + synonym expansion on every chunk             │
-│  • BAAI/bge-small-en-v1.5  — local CPU embeddings, no API cost  │
-│  • ChromaDB persisted at data/chroma/ (wiped on rebuild)        │
-└──────────────┬────────────────────────────┬─────────────────────┘
-               │  dense (k=10, t=0.65)      │  BM25 sparse (k=10)
-               ▼                            ▼
-┌──────────────────────────────────────────────────────────────── ┐
-│              Hybrid Retrieval — Reciprocal Rank Fusion          │
-│  • Dense vector search catches semantic similarity              │
-│  • BM25 catches exact term/numeric matches (e.g. "55 mmHg")     │
-│  • RRF (k=60) fuses both ranked lists → up to 20 candidates     │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │  merged candidates
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Cross-Encoder Reranker                        │
-│  • BAAI/bge-reranker-base — scores (query, chunk) pairs jointly │
-│  • Selects top 5 — real filtering, not just reordering          │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │  top-5 reranked chunks
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      RAG Pipeline                               │
-│  • Constructs cited context block with NCD/LCD headers          │
-│  • LCD jurisdiction note injected only when top-ranked doc      │
-│    is an LCD (not on stray LCD chunks)                          │
-│  • gemini-2.5-flash — answer generation (temperature=0)         │
-│  • Indefinite retry loop reading API retryDelay on rate limits  │
-│  • Returns answer + source Documents                            │
-└──────────┬────────────────────────────┬─────────────────────────┘
-           │                            │
-           ▼                            ▼
-┌─────────────────────┐   ┌─────────────────────────────────────┐
-│    Streamlit UI     │   │         Evaluation Pipeline         │
-│  • Chat interface   │   │                                     │
-│  • Source expander  │   │  generate_golden.py                 │
-│    with full chunk  │   │  • llama-3.1-8b-instant (Groq)      │
-│    text per source  │   │  • 198 Q&A pairs from policy docs   │
-│  • Feedback buttons │   │  • Incremental save + resume        │
-│  • JSONL logging    │   │                                     │
-│    of interactions  │   │  judge.py (RAGAS)                   │
-└─────────────────────┘   │  • Faithfulness                     │
-                          │  • Answer Relevancy                 │
-                          │  • Context Precision                │
-                          │  • gemini-2.5-flash as judge        │
-                          │  • BAAI/bge-small-en-v1.5 embeddings│
-                          │  • Cache path derived from config   │
-                          │  • policy_recall + citation_accuracy│
-                          │  • NCD-only eval (LCD filtered)     │
-                          └─────────────────────────────────────┘
+┌──────────────────────────┐        ┌──────────────────────────┐
+│   CMS Coverage API       │        │   PubMed / NCBI          │
+│   NCDs + LCDs            │        │   E-utilities            │
+└────────────┬─────────────┘        └────────────┬─────────────┘
+             │ fetch (8-worker pool,             │ two-pass per-NCD search
+             │ iterative HTML unescape)          │ (primary-evidence first)
+             ▼                                   ▼
+┌──────────────────────────┐        ┌──────────────────────────┐
+│  cms_coverage  (Chroma)  │        │  pubmed_evidence (Chroma)│
+│  1,983 NCD/LCD chunks    │        │  3,219 abstracts /       │
+│  bge-small embeddings    │        │  296 NCD topics, T1–T5   │
+│  title + synonym expand  │        │  tier-graded, ~89% RCT/  │
+│                          │        │  meta/cohort             │
+└────────────┬─────────────┘        └────────────┬─────────────┘
+             │                                   │
+   ┌─────────┴──────────┐                        │
+   ▼                    ▼                        │
+┌─────────────────┐  ┌───────────────────────────┴──────────────────┐
+│  POLICY Q&A     │  │              GAP ANALYSIS                      │
+│  (prevention)   │  │              (appeals)                        │
+├─────────────────┤  ├───────────────────────────────────────────────┤
+│ hybrid retrieve │  │ NCD-only hybrid retrieve + cross-encoder rerank│
+│ (BM25+dense,RRF)│  │            │                                   │
+│   │             │  │            ▼  score-weighted vote per NCD      │
+│   ▼             │  │  ┌──────────────────────────────────────────┐ │
+│ bge-reranker    │  │  │ NCD disambiguation: when top candidates  │ │
+│ top-5           │  │  │ score close, one LLM call reads the      │ │
+│   │             │  │  │ question vs candidate titles → picks the │ │
+│   ▼             │  │  │ governing NCD(s), cap 2                   │ │
+│ cited context   │  │  └──────────────────────┬───────────────────┘ │
+│ + LCD juris note│  │            ▼  whole-NCD full text (not chunks) │
+│   │             │  │     topical join → PubMed for that NCD only   │
+│   ▼             │  │            ▼                                   │
+│ gemini-2.5-flash│  │     gemini-2.5-flash → structured gap report  │
+│ → cited answer  │  │     (Coverage Position · Evidence · Grade ·   │
+│                 │  │      Alignment · Gap Summary)                 │
+└────────┬────────┘  └───────────────────────┬───────────────────────┘
+         │                                   │
+         ▼                                   ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  Streamlit UI (auto-routes Q&A vs gap) · JSONL interaction logs   │
+│  Evaluation: judge.py (RAGAS, Policy Q&A) · judge_gap.py (gap)    │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ### Model roles
 
 | Model | Provider | Role |
 |---|---|---|
-| `gemini-2.5-flash` | Google AI | Answer generation in the RAG pipeline + RAGAS judge |
-| `llama-3.1-8b-instant` | Groq | Synthetic Q&A generation (golden dataset only) |
-| `BAAI/bge-small-en-v1.5` | HuggingFace (local) | Document and query embeddings + RAGAS Answer Relevancy embeddings |
-| `BAAI/bge-reranker-base` | HuggingFace (local) | Cross-encoder reranking of retrieved chunks |
+| `gemini-2.5-flash` | Google AI | Policy answer generation · **gap report synthesis** · **NCD disambiguation** · independent gap reference labeling · RAGAS judge |
+| `llama-3.1-8b-instant` | Groq | Synthetic question generation (Policy Q&A + gap golden sets) |
+| `BAAI/bge-small-en-v1.5` | HuggingFace (local) | Document/query embeddings (both collections) + RAGAS Answer Relevancy |
+| `BAAI/bge-reranker-base` | HuggingFace (local) | Cross-encoder reranking; on the gap side, used only to *identify* the governing NCD |
 
 ---
 
-## Evaluation Results
+## Gap Analysis — how it works
 
-Evaluated on 79 NCD questions (LCD entries excluded — Phase 1). Config: k=10, threshold=0.65, reranker top_n=5, search_mode=hybrid. Judge: gemini-2.5-flash.
+Beyond surface retrieval, the gap pipeline reasons about **where CMS coverage and the evidence diverge**, and maps each verdict to one analyst action.
+
+- **Governing-NCD selection (disambiguation).** NCD-only hybrid retrieval + cross-encoder rerank produce a score-weighted vote per NCD. When the top candidates score close — the case where the rerank argmax is unreliable — **one bounded LLM call reads the question against the candidate NCD titles and picks which policy actually governs** (cap 2). This corrects the primary pick (top-1 accuracy 0.830 → 0.917 on the golden set) and selects a single clean policy, lifting recall *and* cutting cross-policy contamination — something neither a score threshold nor a numbering-hierarchy rule could do.
+- **Whole-NCD context.** The full text of the governing NCD is supplied — not the top-5 question-similar chunks — so the eligibility-criteria section (which separates a *Partial Coverage Gap* from *Aligned*) can never be dropped by chunk ranking.
+- **Topical join for evidence.** PubMed abstracts are pulled *only for the governing NCD(s)* (`source_ncd_number == policy_number`), so evidence and coverage position describe the same intervention. Dense top-12, newest-first, no reranker (bge-reranker isn't trained on clinical text). An empty join yields *Insufficient Evidence*, never unrelated abstracts.
+- **Structured synthesis.** `gemini-2.5-flash` emits a fixed format — CMS Coverage Position · Clinical Evidence (`PMID` bullets, tier-graded T1–T5) · Evidence Grade · Alignment · Gap Summary. The prompt forbids citing un-retrieved PMIDs.
+- **Calibrated label boundaries.** *Partial* requires a **named** excluded population treated with the **same** covered intervention (a different drug/device/program is not this policy's gap). The *Insufficient* gate discards an abstract only as a **name-collision** — a genuinely different intervention sharing a name — never for studying an adjacent population of the same intervention.
+- **Action-oriented alignment.** Aligned (no action) · Partial Coverage Gap (broaden) · Coverage Gap (expand/appeal) · Overcoverage (utilization review) · Insufficient Evidence (manual review).
+
+---
+
+## Evaluation
+
+### Policy Q&A (RAGAS)
+
+79-question NCD subset (LCDs filtered). Config: k=10, threshold=0.65, reranker top_n=5, hybrid search. Judge: `gemini-2.5-flash`.
 
 | Metric | Score | Target |
 |---|:---:|:---:|
@@ -104,65 +98,36 @@ Evaluated on 79 NCD questions (LCD entries excluded — Phase 1). Config: k=10, 
 | Citation Accuracy | **0.911** | > 95% |
 | Policy Recall | **0.987** ✅ | > 90% |
 
----
+### Gap analysis (independent judge)
 
-## Evidence Gap Analysis (Phase 2 — branch: `phase-2`)
+Reference labels come from an **independent `gemini-2.5-flash` labeler** that reads the raw NCD + abstracts — never the pipeline's own report — and are additionally cross-vendor adjudicated by Claude. 276-record golden set.
 
-Beyond "what does CMS cover?", the agent answers "where is CMS coverage out of step with published evidence?" The UI auto-routes each question to Policy Q&A or Gap Analysis by regex signal scoring — no manual toggle.
-
-**Who it's for:** the same provider revenue-cycle team, at the *back* door. Phase 1 prevents denials pre-service; Phase 2 serves **denial-management / appeals specialists** building appeals for *"not medically necessary"* and *"experimental/investigational"* denials. That appeal is an evidence-vs-coverage argument — the NCD/LCD doesn't cover it, but here's the literature supporting medical necessity — which is exactly the `Coverage Gap` / `Partial Coverage Gap` report (cited PMIDs + evidence grade) this produces.
-
-<details>
-<summary><strong>How gap analysis works</strong></summary>
-
-- **Policy side (whole-NCD context):** NCD-only hybrid retrieval + cross-encoder rerank is used only to *identify* the governing NCD via a score-weighted vote (sigmoid of the reranker logit; a runner-up NCD is added only if within 70% of the top, capped at 2). The **full text of that NCD** is then supplied — not just the top-5 chunks — so the eligibility-criteria section (which distinguishes a *Partial Coverage Gap* from *Aligned*) can't be dropped by chunk ranking.
-- **Topical join:** PubMed abstracts are pulled *only for the primary NCD(s)* (`source_ncd_number == policy_number`), so evidence and coverage position describe the same intervention. Dense top-12, newest-first, no reranker (bge-reranker isn't trained on clinical text). Empty join → "Insufficient Evidence" rather than unrelated abstracts.
-- **Synthesis:** `gemini-2.5-flash` emits a structured report — CMS Coverage Position · Clinical Evidence (`PMID` bullets, tier-graded T1–T5) · Evidence Grade · Alignment · Gap Summary. The prompt forbids citing un-retrieved PMIDs.
-- **Action-oriented alignment** — each label maps to one analyst action, classified by *which side is ahead*: Aligned (no action) · Partial Coverage Gap (broaden) · Coverage Gap (expand/appeal) · Overcoverage (utilization review) · Insufficient Evidence (manual review).
-- **Evidence corpus:** 3,219 PubMed abstracts (`pubmed_evidence` collection) across 296 NCD topics via NCBI E-utilities, ~89% primary evidence (two-pass primary-evidence search + MeSH study-type fallback).
-
-</details>
-
-<details>
-<summary><strong>Gap evaluation (independent judge)</strong></summary>
-
-Reference labels come from an **independent `gemini-2.5-flash` judge** that reads the raw NCD + abstracts — never the pipeline's own report — so the eval isn't graded against itself; labels are additionally cross-vendor adjudicated by Claude.
+`alignment_accuracy = label_match ∧ ncd_recall`, so failures decompose into *retrieval* vs *reasoning*.
 
 | Metric | Measures |
 |---|---|
 | `alignment_accuracy` | End-to-end: right alignment **and** right NCD retrieved |
-| `alignment_label_match` | Diagnostic: raw label agreement (retrieval-blind) |
+| `alignment_label_match` | Raw label agreement (retrieval-blind) |
 | `alignment_kappa` | Quadratic-weighted Cohen's κ on the evidence-vs-coverage direction |
-| `ncd_recall` | Expected NCD surfaced by retrieval |
-| `pmid_recall` | Fraction of key reference PMIDs cited |
-| `pmid_recall_retrieved` | Citation recall over reference PMIDs actually retrieved (isolates citation behavior from the retrieval-mechanism mismatch) |
-| `citation_precision` | Fraction of cited PMIDs that were actually retrieved |
+| `alignment_action_match` | Provider action bucket: appeal / covered / manual |
+| `ncd_recall` | Governing NCD surfaced and selected |
+| `pmid_recall` / `pmid_recall_retrieved` | Reference-PMID citation recall (overall / over retrieved) |
+| `citation_precision` | Cited PMIDs that were actually retrieved (fabrication guard) |
 | `faithfulness` | RAGAS faithfulness vs policy + PubMed contexts |
 
-`alignment_accuracy = label_match ∧ ncd_recall`, so the metrics decompose failures into retrieval vs reasoning.
+**Where it stands.** The last full 277-record benchmark of the whole-NCD pipeline scored `alignment_accuracy` 0.542, `kappa` 0.433, `faithfulness` 0.705, `ncd_recall` 0.888 (`citation_precision` 0.994 = effectively zero fabrication). The current build then added three changes — the **disambiguation step**, a tightened **Partial** boundary, and an **Insufficient-gate** precision fix:
 
-**Results (full 277-record golden set).** Two pipeline variants measured end-to-end:
+- NCD selection (LLM-free backtest, n=277): top-1 **0.830 → 0.917**, `ncd_recall` **0.888 → 0.921**, multi-policy contamination **26% → 0.7%**.
+- Paired representative sample (seeded-random 25, same records old vs new): `alignment_accuracy` **0.520 → 0.640**, `ncd_recall` **0.800 → 0.880**.
 
-| Metric | Top-5-chunk | Whole-NCD |
-|---|:---:|:---:|
-| `alignment_accuracy` | **0.570** | 0.542 |
-| `alignment_label_match` | 0.581 | 0.570 |
-| `alignment_kappa` | 0.346 | **0.433** |
-| `ncd_recall` | **0.942** | 0.888 |
-| `pmid_recall` | 0.637 | 0.633 |
-| `citation_precision` | 0.998 | 0.994 |
-| `faithfulness` (random subsample) | 0.597 | **0.705** |
-
-The whole-NCD variant feeds the governing NCD's full text (better grounding → higher kappa/faithfulness, and recovers `Partial Coverage Gap` label_match 0.20→0.33), but its capped NCD-selection lowers `ncd_recall`, so end-to-end accuracy is a wash. Net: a *trade, not a win* — see PRD §15.2.2.
+A full 277-record re-eval of the current stack is the next step; the random-25 predicts it clears the prior 0.570 baseline.
 
 ```bash
-python -m src.ingestion.fetch_pubmed         # fetch PubMed abstracts
-python -m src.rag.pubmed_indexer             # build pubmed_evidence collection
-python -m src.evaluation.generate_golden_gap # independent reference labels
-python -m src.evaluation.judge_gap           # score the gap pipeline
+python -m src.ingestion.fetch_pubmed          # fetch PubMed abstracts
+python -m src.rag.pubmed_indexer              # build pubmed_evidence collection
+python -m src.evaluation.generate_golden_gap  # independent reference labels
+python -m src.evaluation.judge_gap            # score the gap pipeline
 ```
-
-</details>
 
 ---
 
@@ -171,37 +136,28 @@ python -m src.evaluation.judge_gap           # score the gap pipeline
 ```
 src/
 ├── ingestion/
-│   ├── fetch.py              # CMS API client — NCDs and LCDs
-│   └── fetch_pubmed.py       # PubMed via NCBI E-utilities (Phase 2)
+│   ├── fetch.py              # CMS Coverage API client — NCDs + LCDs
+│   └── fetch_pubmed.py       # PubMed via NCBI E-utilities (two-pass primary-evidence)
 ├── rag/
 │   ├── embedder.py           # HuggingFace embedding wrapper
-│   ├── indexer.py            # ChromaDB build + load (cms_coverage collection)
-│   ├── pubmed_indexer.py     # ChromaDB build + load (pubmed_evidence) (Phase 2)
-│   └── pipeline.py           # Hybrid retrieval, reranking, generation, gap_analysis
+│   ├── indexer.py            # ChromaDB build/load — cms_coverage collection
+│   ├── pubmed_indexer.py     # ChromaDB build/load — pubmed_evidence collection
+│   └── pipeline.py           # Hybrid retrieval, rerank, NCD disambiguation,
+│                             #   generation, gap_analysis
 ├── evaluation/
-│   ├── generate_golden.py        # Synthetic Q&A dataset (198 pairs)
-│   ├── generate_golden_gap.py    # Independent gap reference labels (Phase 2)
+│   ├── generate_golden.py        # Synthetic Policy Q&A dataset
+│   ├── generate_golden_gap.py    # Independent gap reference labels
 │   ├── judge.py                  # RAGAS evaluation — Policy Q&A
-│   └── judge_gap.py              # Gap analysis evaluation (Phase 2)
+│   └── judge_gap.py              # Gap analysis evaluation
 └── ui/
-    └── app.py                # Streamlit chat UI — auto-routes Q&A vs gap
+    └── app.py                # Streamlit UI — auto-routes Q&A vs gap
 
-data/                         # committed to git
-├── ncd_raw.json              # Raw NCD data from CMS API
-├── lcd_raw.json              # Raw LCD data from CMS API
-└── chroma/                   # ChromaDB — cms_coverage (1983) + pubmed_evidence (3219)
+scripts/                      # one-off analysis: NCD-selection sweeps + backtests,
+                              #   paired random-N gap eval
 
-data/                         # gitignored
-├── pubmed_raw.json           # PubMed abstracts (Phase 2)
-├── golden_dataset.json       # 198-pair Q&A eval set (79 NCD, 119 LCD)
-├── gap_questions.json        # Cached gap questions (Phase 2)
-└── golden_gap.json           # Gap eval set — independent labels (Phase 2)
-
-logs/                         # gitignored
-├── eval_results.jsonl        # Aggregate scores per run
-├── eval_samples_latest.json  # Per-sample scores from latest run
-├── rag_answers_cache_*.json  # Persistent answer cache (named by config + search_mode)
-└── interactions.jsonl        # UI interaction log
+data/   chroma/  → cms_coverage (1,983 chunks) + pubmed_evidence (3,219 abstracts)
+        (golden_gap.json, gap_questions.json, pubmed_raw.json are gitignored)
+logs/   eval_*.jsonl/json, answer caches, interactions.jsonl  (gitignored)
 ```
 
 ---
@@ -210,46 +166,38 @@ logs/                         # gitignored
 
 **Prerequisites:** Python 3.11+, a Google AI API key (paid tier recommended).
 
-### 1. Create and activate the virtual environment
-
 ```bash
+# 1. virtual environment
 python -m venv agent
-agent\Scripts\activate      # Windows
-source agent/bin/activate   # macOS / Linux
-```
+agent\Scripts\activate        # Windows
+source agent/bin/activate     # macOS / Linux
 
-### 2. Install dependencies
-
-```bash
+# 2. dependencies
 pip install -r requirements.txt
 ```
 
-### 3. Configure environment
-
-Create a `.env` file in the project root:
+Create a `.env` in the project root:
 
 ```
 GOOGLE_API_KEY=your_google_api_key_here
-GROQ_API_KEY=your_groq_api_key_here   # only needed for generate_golden.py
+GROQ_API_KEY=your_groq_api_key_here   # only for question generation
 ```
 
-### 4. Ingest CMS data
-
-Fetches all NCDs and LCDs from the CMS Coverage API (~2–3 min):
+**Build the policy index (Policy Q&A):**
 
 ```bash
-python -m src.ingestion.fetch
+python -m src.ingestion.fetch       # fetch NCDs + LCDs (~2–3 min)
+python -m src.rag.indexer           # chunk, embed, persist cms_coverage
 ```
 
-### 5. Build the vector index
-
-Chunks, embeds, and persists documents to ChromaDB:
+**Build the evidence index (Gap Analysis):**
 
 ```bash
-python -m src.rag.indexer
+python -m src.ingestion.fetch_pubmed   # fetch abstracts per NCD topic
+python -m src.rag.pubmed_indexer       # persist pubmed_evidence
 ```
 
-### 6. Launch the UI
+**Launch the UI:**
 
 ```bash
 streamlit run src/ui/app.py
@@ -257,31 +205,10 @@ streamlit run src/ui/app.py
 
 ---
 
-## Evaluation
-
-### Generate the golden dataset
-
-Generates 198 synthetic Q&A pairs (79 NCD, 119 LCD) using `llama-3.1-8b-instant` via Groq. Supports resuming — re-running picks up where it left off:
-
-```bash
-python -m src.evaluation.generate_golden
-```
-
-### Run RAGAS evaluation
-
-Scores the pipeline on the 79-question NCD subset. Answers are cached in `logs/rag_answers_cache_*.json` — already-answered questions are never re-fetched:
-
-```bash
-python -m src.evaluation.judge
-```
-
-Per-sample scores are written to `logs/eval_samples_latest.json` after each run.
-
----
-
 ## Environment Variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `GOOGLE_API_KEY` | Yes | Google AI API key — answer generation + RAGAS judge |
-| `GROQ_API_KEY` | Only for `generate_golden.py` | Groq API key for synthetic dataset generation |
+| `GOOGLE_API_KEY` | Yes | Policy answers · gap synthesis · NCD disambiguation · gap labeling · RAGAS judge |
+| `GROQ_API_KEY` | Question generation only | Synthetic Policy Q&A + gap question sets |
+```
