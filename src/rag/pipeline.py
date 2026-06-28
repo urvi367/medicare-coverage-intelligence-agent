@@ -301,16 +301,25 @@ _LCD_ADDENDUM = (
 )
 
 
-def _build_system(docs: list[Document]) -> str:
-    """Return a system prompt with the LCD note only when the top-ranked doc is an LCD.
+def _build_system(docs: list[Document], mac: str | None = None) -> str:
+    """Return a system prompt, adding an LCD jurisdiction note when the docs are LCDs.
 
-    Stray LCD chunks ranked 2nd-5th (cosine overlap on a related topic) should not
-    trigger a jurisdiction warning on what is otherwise an NCD answer.
+    When the governing policy is an LCD (cascade fell through from a silent/deferring
+    NCD), `mac` names the resolving contractor so the note cites the real jurisdiction
+    instead of "unknown".
     """
     has_lcd = bool(docs) and docs[0].metadata.get("source", "") == "LCD"
     base = _BASE_SYSTEM
     if has_lcd:
-        base += _LCD_ADDENDUM
+        if mac:
+            base += (
+                f"\n\nThe retrieved documents are Local Coverage Determinations (LCDs) from "
+                f"{mac}. Begin your answer with: 'This coverage is based on the {mac} LCD and "
+                f"applies to that MAC's jurisdiction only; coverage may differ in other regions.' "
+                f"Then answer the coverage question strictly from the LCD's criteria."
+            )
+        else:
+            base += _LCD_ADDENDUM
     return base + "\n\nRetrieved documents:\n{context}"
 
 
@@ -350,27 +359,51 @@ def _retryable(exc: BaseException) -> bool:
                                   "resource exhausted", "service unavailable"))
 
 
+def _no_policy_message(note: str, needs_state: bool) -> str:
+    """User-facing message when the NCD→LCD cascade finds no governing policy."""
+    if needs_state:
+        return ("This service has no national coverage determination (NCD), so coverage is set "
+                "by the local Medicare Administrative Contractor (MAC). Which US state is the "
+                "beneficiary in?")
+    if note == "unsupported_jurisdiction":
+        return ("This service has no NCD; coverage is set by the local MAC, which isn't among the "
+                "jurisdictions this assistant currently supports.")
+    if note == "lookup_failed":
+        return ("This service has no NCD, and the local LCD service is temporarily unavailable — "
+                "please verify on the Medicare Coverage Database.")
+    return ("No NCD or LCD coverage determination was found for this service in this jurisdiction; "
+            "coverage may be at contractor discretion / by individual consideration.")
+
+
 def answer(
     question: str,
     model: str = "gemini-2.5-flash",
     k: int | None = None,
+    state: str | None = None,
 ) -> dict[str, Any]:
-    """Retrieve relevant policy chunks and return a cited answer via Gemini.
+    """Answer a coverage question via the NCD→LCD cascade.
 
-    Returns a dict with keys:
-        answer  — the generated response string
-        sources — list of source Documents used
+    NCD governs → answer from the NCD. NCD silent/defers → the beneficiary's
+    jurisdiction LCD (fetched live; asks for the state if unknown). Neither → no
+    determination found.
+
+    Returns {answer, sources, needs_state}.
     """
-    llm = ChatGoogleGenerativeAI(model=model, temperature=0)
+    from src.lcd.resolve import resolve_governing_policy
 
-    sources: list[Document] = _rerank(
-        question,
-        _hybrid_retrieve(question, k or PIPELINE_CONFIG["k"]),
-        top_n=PIPELINE_CONFIG["reranker_top_n"],
-    )
+    resolved = resolve_governing_policy(question, state=state)
+    if resolved.source == "none":
+        return {
+            "answer": _no_policy_message(resolved.note, resolved.needs_state),
+            "sources": [],
+            "needs_state": resolved.needs_state,
+        }
+
+    llm = ChatGoogleGenerativeAI(model=model, temperature=0)
+    sources: list[Document] = resolved.policy_docs
     context = _format_docs(sources)
     prompt = ChatPromptTemplate.from_messages(
-        [("system", _build_system(sources)), ("human", "{question}")]
+        [("system", _build_system(sources, mac=resolved.mac)), ("human", "{question}")]
     )
     prompt_value = prompt.format_messages(context=context, question=question)
 
@@ -378,7 +411,7 @@ def answer(
     while True:
         try:
             response = llm.invoke(prompt_value)
-            return {"answer": response.content, "sources": sources}
+            return {"answer": response.content, "sources": sources, "needs_state": False}
         except Exception as exc:
             if not _retryable(exc):
                 raise
