@@ -129,6 +129,52 @@ def _hybrid_retrieve_ncd(query: str, k: int) -> list[Document]:
     return [doc_map[k_] for k_ in ranked[:k]]
 
 
+def _hybrid_retrieve_lcd(query: str, k: int, mac: str) -> list[Document]:
+    """Hybrid retrieve restricted to LCD chunks for one MAC jurisdiction.
+
+    Body-based semantic retrieval (the LCD's coverage criteria), filtered to the
+    beneficiary's MAC via metadata — so a query reaches the right LCD by content,
+    not by its (often broad) title.
+    """
+    db = _get_db()
+    flt = {"$and": [{"source": "LCD"}, {"mac": mac}]}
+    # Plain top-k (no score threshold): a short clinical query vs a long LCD body often
+    # scores below the policy-QA 0.65 cosine cut, so let the cross-encoder gate instead.
+    dense_docs = db.as_retriever(
+        search_type="similarity", search_kwargs={"k": k, "filter": flt},
+    ).invoke(query)
+    bm25_docs = [
+        d for d in _get_bm25(k).invoke(query)
+        if d.metadata.get("source") == "LCD" and d.metadata.get("mac") == mac
+    ]
+
+    scores: dict[str, float] = {}
+    doc_map: dict[str, Document] = {}
+    for rank, doc in enumerate(dense_docs):
+        key = doc.page_content
+        scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank + 1)
+        doc_map[key] = doc
+    for rank, doc in enumerate(bm25_docs):
+        key = doc.page_content
+        scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank + 1)
+        doc_map[key] = doc
+
+    ranked = sorted(scores, key=lambda x: scores[x], reverse=True)
+    return [doc_map[k_] for k_ in ranked[:k]]
+
+
+def _full_lcd_docs(lcd_id: str, mac: str) -> list[Document]:
+    """Return all indexed chunks for one LCD in one MAC (whole-LCD context)."""
+    got = _get_db().get(
+        where={"$and": [{"policy_number": lcd_id}, {"mac": mac}]},
+        include=["documents", "metadatas"],
+    )
+    return [
+        Document(page_content=t, metadata=m)
+        for t, m in zip(got["documents"], got["metadatas"])
+    ]
+
+
 def _pubmed_for_ncds(query: str, ncd_numbers: set[str], k: int) -> list[Document]:
     """Retrieve PubMed abstracts restricted to specific NCD topics, ranked by query.
 
@@ -570,56 +616,58 @@ def _format_pubmed_docs(docs: list[Document]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
+def _pubmed_semantic(query: str, k: int) -> list[Document]:
+    """Dense semantic search over the pubmed_evidence index (no NCD topical filter).
+
+    Used for LCD gap analysis: an LCD has no source_ncd_number to topical-join on, so
+    evidence is retrieved by RAG over the same index — consistent with the NCD path,
+    not a live fetch. (May be sparse until PubMed ingestion is extended to LCD topics.)
+    """
+    try:
+        db = _get_pubmed_db()
+    except RuntimeError:
+        logger.warning("PubMed index not found — run fetch_pubmed + pubmed_indexer first")
+        return []
+    docs = db.similarity_search(query, k=k)
+    docs.sort(key=lambda d: d.metadata.get("year", "0"), reverse=True)
+    return docs
+
+
 def gap_analysis(
     question: str,
     model: str = "gemini-2.5-flash",
     k: int | None = None,
+    state: str | None = None,
 ) -> dict[str, Any]:
-    """Retrieve CMS policy + PubMed evidence and return a structured gap report.
+    """Gap analysis via the NCD→LCD cascade: compare the governing policy (the NCD if
+    it governs, else the jurisdiction's LCD) against PubMed evidence.
 
-    Returns a dict with keys:
-        gap_report     — structured gap analysis string
-        policy_sources — CMS NCD/LCD Documents used
-        pubmed_sources — PubMed abstract Documents used
+    Returns {gap_report, policy_sources, pubmed_sources, needs_state}.
     """
-    k_ = k or PIPELINE_CONFIG["k"]
+    from src.lcd.resolve import resolve_governing_policy
 
-    # Use chunk retrieval only to IDENTIFY the governing NCD, then feed its full text.
-    reranked = _rerank_scored(
-        question,
-        _hybrid_retrieve_ncd(question, k_),
-        top_n=PIPELINE_CONFIG["reranker_top_n"],
-    )
-    primary_ncds = _select_primary_ncds(reranked, question=question)
-
-    if primary_ncds:
-        # Whole-NCD context: a coverage determination is one document, so supply the
-        # complete policy (covered + non-covered indications + criteria) rather than
-        # the handful of question-similar chunks, which can omit the criteria section.
-        policy_docs: list[Document] = [d for n in primary_ncds for d in _full_ncd_docs(n)]
-        ncd_numbers = set(primary_ncds)
-    else:
-        # Fallback (no policy_number on any chunk): keep the reranked chunks as-is.
-        policy_docs = [d for _, d in reranked]
-        ncd_numbers = {
-            d.metadata.get("policy_number")
-            for d in policy_docs
-            if d.metadata.get("policy_number")
+    resolved = resolve_governing_policy(question, state=state, disambiguate=True)
+    if resolved.source == "none":
+        return {
+            "gap_report": "CMS Coverage Position: Not Addressed\n\nAlignment: Insufficient "
+                          "Evidence\n\nGap Summary: " + _no_policy_message(resolved.note, resolved.needs_state),
+            "policy_sources": [],
+            "pubmed_sources": [],
+            "needs_state": resolved.needs_state,
         }
 
-    # Topical join: pull evidence only for the primary NCD(s), so the abstracts and
-    # the coverage position are guaranteed to describe the same intervention.
-
-    try:
-        # Topical join only. If an NCD has no indexed abstracts we return nothing,
-        # so the report yields "Insufficient Evidence" rather than comparing the
-        # policy against unrelated abstracts pulled by an open (non-topical) search.
-        pubmed_docs: list[Document] = _pubmed_for_ncds(question, ncd_numbers, k=PIPELINE_CONFIG["pubmed_k"])
-        # Sort newest-first so Gemini weights recent evidence more heavily.
-        pubmed_docs.sort(key=lambda d: d.metadata.get("year", "0"), reverse=True)
-    except RuntimeError:
-        logger.warning("PubMed index not found — run fetch_pubmed + pubmed_indexer first")
-        pubmed_docs = []
+    policy_docs: list[Document] = resolved.policy_docs
+    if resolved.source == "ncd":
+        # Topical join: evidence is indexed per NCD, guaranteed same-intervention.
+        try:
+            pubmed_docs: list[Document] = _pubmed_for_ncds(
+                question, set(resolved.policy_ids), k=PIPELINE_CONFIG["pubmed_k"])
+            pubmed_docs.sort(key=lambda d: d.metadata.get("year", "0"), reverse=True)
+        except RuntimeError:
+            logger.warning("PubMed index not found — run fetch_pubmed + pubmed_indexer first")
+            pubmed_docs = []
+    else:  # lcd — no NCD to topical-join on, so retrieve evidence by RAG over the index
+        pubmed_docs = _pubmed_semantic(question, PIPELINE_CONFIG["pubmed_k"])
 
     policy_context = _format_docs(policy_docs) if policy_docs else "No CMS policy documents retrieved."
     pubmed_context = _format_pubmed_docs(pubmed_docs)
@@ -641,6 +689,7 @@ def gap_analysis(
                 "gap_report": response.content,
                 "policy_sources": policy_docs,
                 "pubmed_sources": pubmed_docs,
+                "needs_state": False,
             }
         except Exception as exc:
             if not _retryable(exc):

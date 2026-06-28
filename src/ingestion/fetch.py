@@ -15,6 +15,8 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+from src.lcd.jurisdiction import SUPPORTED_MACS as _SUPPORTED_MACS
+
 BASE = "https://api.coverage.cms.gov/v1"
 DATA_DIR = Path(__file__).parents[2] / "data"
 PAGE_SIZE = 100
@@ -157,6 +159,39 @@ def fetch_and_save(doc_type: str, max_docs: int = 500) -> Path:
     return out
 
 
+def fetch_lcds_for_macs(macs: list[str]) -> Path:
+    """Fetch ACTIVE LCDs (with full body text) for the given MAC contractors.
+
+    Re-fetches via the live list + license-token detail endpoint (the body lives in
+    the detail response, not the list). Filters out retired LCDs and any not served
+    by an in-scope MAC. Saves to data/lcd_raw.json, replacing the stale snapshot.
+    """
+    logger.info("Obtaining LCD license token...")
+    token = _get_license_token()
+    items = _paginate("reports/local-coverage-final-lcds")
+    selected = [
+        x for x in items
+        if (x.get("retirement_date") or "N/A").strip() == "N/A"
+        and any(m in (x.get("contractor_name_type") or "") for m in macs)
+    ]
+    logger.info("  → %d active in-scope LCDs; fetching full text in parallel...", len(selected))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        records = list(pool.map(lambda it: _fetch_lcd_detail(it, token), selected))
+
+    # Keep only fields used for indexing/metadata — drop bulky unused sections
+    # (bibliography, summary_of_evidence, …) so the saved file stays small.
+    keep = {"document_id", "document_version", "document_display_id", "title",
+            "contractor_name_type", "retirement_date", "indication",
+            "indications_limitations", "indications_limitations_text",
+            "coverage_indications", "description", "cms_cov_policy"}
+    records = [{k: v for k, v in r.items() if k in keep} for r in records]
+
+    out = DATA_DIR / "lcd_raw.json"
+    out.write_text(json.dumps(records, indent=2), encoding="utf-8")
+    logger.info("Saved %d LCDs (with body) to %s", len(records), out)
+    return out
+
+
 def load_documents(doc_type: str) -> list[dict[str, str]]:
     """Load saved raw JSON and return cleaned text + metadata dicts ready for indexing."""
     path = DATA_DIR / f"{doc_type}_raw.json"
@@ -164,7 +199,9 @@ def load_documents(doc_type: str) -> list[dict[str, str]]:
 
     # NCD detail fields confirmed from API; LCD fields may vary, so we try several
     ncd_text_fields = ["item_service_description", "indications_limitations"]
-    lcd_text_fields = ["indications_limitations", "indications_limitations_text",
+    # `indication` is the LCD's indications/limitations-of-coverage section (the core
+    # coverage criteria); the others are fallbacks for differing API shapes.
+    lcd_text_fields = ["indication", "indications_limitations", "indications_limitations_text",
                        "coverage_indications", "description"]
     text_fields = ncd_text_fields if doc_type == "ncd" else lcd_text_fields
 
@@ -175,15 +212,27 @@ def load_documents(doc_type: str) -> list[dict[str, str]]:
         text = _strip_html(f"{title}\n\n{body}".strip())
         if not text:
             continue
-        docs.append(
-            {
-                "text": text,
-                "source": doc_type.upper(),
-                "title": title,
-                "policy_number": r.get("document_display_id", ""),
-                "doc_id": str(r.get("document_id", "")),
-            }
-        )
+        base = {
+            "text": text,
+            "source": doc_type.upper(),
+            "title": title,
+            "policy_number": r.get("document_display_id", ""),
+            "doc_id": str(r.get("document_id", "")),
+        }
+        if doc_type != "lcd":
+            docs.append(base)
+            continue
+        # LCDs are jurisdictional: skip retired, tag each with the serving in-scope
+        # MAC(s). Emit one doc per MAC so `mac` stays scalar for exact Chroma filtering
+        # (a few LCDs are shared across MACs).
+        if (r.get("retirement_date") or "N/A").strip() != "N/A":
+            continue
+        contractor = r.get("contractor_name_type", "") or ""
+        serving = [m for m in _SUPPORTED_MACS if m in contractor]
+        if not serving:
+            continue
+        for mac in serving:
+            docs.append({**base, "contractor": contractor.splitlines()[0].strip(), "mac": mac})
 
     return docs
 

@@ -1,11 +1,11 @@
 """Governing-policy cascade — shared by Policy Q&A and Gap Analysis (Phase 3).
 
 NCD first: if a National Coverage Determination governs the service, that IS the
-answer. Otherwise fall back to the beneficiary's jurisdiction LCD (fetched live).
-If neither governs, nothing does ("idk"). This is the resolution step both
-`answer()` and `gap_analysis()` call — not a separate path. Routing is
-deterministic (relevance gate + defer-marker + state→MAC); only the live LCD
-fetch is dynamic tool-use.
+answer. Otherwise fall back to the beneficiary's jurisdiction LCD, retrieved by
+RAG over the indexed LCD bodies and filtered to that MAC. If neither governs,
+nothing does ("idk"). This is the resolution step both `answer()` and
+`gap_analysis()` call — not a separate path. Routing is deterministic (relevance
+gates + defer-marker + state→MAC); retrieval is body-based RAG, like NCDs.
 """
 from __future__ import annotations
 
@@ -17,35 +17,41 @@ from dataclasses import dataclass, field
 from langchain_core.documents import Document
 
 from src.lcd.jurisdiction import _STATE_NAMES, extract_state, ncd_disposition, resolve_mac
-from src.lcd.lookup import LcdLookupError, lcd_lookup
 
 logger = logging.getLogger(__name__)
 
-# Top-NCD rerank sigmoid below this ⇒ no NCD is on-topic ⇒ go local (governed
-# services score ~0.73, LCD-only ~0.55 on the golden set).
-SILENT_GATE = 0.60
+# Top reranked-chunk sigmoid below this ⇒ nothing on-topic governs.
+SILENT_GATE = 0.60   # NCD side (governed ~0.73 vs LCD-only ~0.55)
+LCD_GATE = 0.55      # LCD side: no MAC LCD is relevant enough → contractor discretion
 
-# Coverage-question framing to strip so the LCD matcher sees the clinical service,
-# not "is … covered … in <state>?" noise (the matcher expects a clean service term).
-_QUESTION_NOISE = re.compile(
-    r"\b(is|are|was|were|does|do|did|can|could|will|would|should|has|have|"
-    r"cover|covered|coverage|covers|for|my|the|a|an|to|in|of|on|under|when|"
-    r"whether|if|patient|patients|beneficiary|beneficiaries|medicare|cms|"
-    r"reimburse|reimbursed|reimbursement|eligible|service|please|this|that|"
-    r"there|any|state|jurisdiction|region|area|local|lcd|ncd)\b",
+# Coverage/evidence-question framing stripped before LCD retrieval: LCD bodies share
+# a lot of "covered…patient…medically necessary" boilerplate, so a noisy query matches
+# the wrong LCD — denoising to the clinical service term fixes retrieval (NOT title
+# matching; the match is still over the body).
+_QNOISE = re.compile(
+    r"\b(is|are|was|were|does|do|did|can|could|will|would|should|has|have|cover|covered|"
+    r"coverage|covers|for|my|the|a|an|to|in|of|on|under|when|whether|if|patient|patients|"
+    r"beneficiary|medicare|cms|reimburse|reimbursed|eligible|service|please|this|that|"
+    r"there|any|state|jurisdiction|region|area|local|lcd|ncd|what|whats|evidence|show|"
+    r"shows|support|supports|supported|about|data|research|study|studies|literature|"
+    r"clinical|effective|effectiveness|patient's)\b",
     re.IGNORECASE,
 )
 
 
-def _service_term(question: str, state_code: str) -> str:
-    """Strip the state mention + coverage-question framing → a clean service term."""
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def _denoise(question: str, state_code: str) -> str:
+    """Strip the state mention + coverage/evidence-question framing → clinical term."""
     s = question
     for name, code in _STATE_NAMES.items():
         if code == state_code:
             s = re.sub(rf"\b{re.escape(name)}\b", " ", s, flags=re.IGNORECASE)
     if state_code:
         s = re.sub(rf"\b{re.escape(state_code)}\b", " ", s)
-    s = _QUESTION_NOISE.sub(" ", s)
+    s = _QNOISE.sub(" ", s)
     s = re.sub(r"[^\w\s./-]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s or question
@@ -60,8 +66,7 @@ class ResolvedPolicy:
     title: str = ""
     mac: str | None = None
     needs_state: bool = False
-    # for source == "none": why — need_state | unsupported_jurisdiction
-    #                              | lookup_failed | no_determination
+    # for source == "none": why — need_state | unsupported_jurisdiction | no_determination
     note: str = ""
 
 
@@ -73,26 +78,24 @@ def resolve_governing_policy(
     Args:
         question: the coverage question.
         state: optional known state (e.g. from a prior "which state?" turn).
-        disambiguate: if True, use the LLM disambiguation step to pick the primary
-            NCD (gap analysis wants this); if False, the deterministic vote (cheaper,
-            for Policy Q&A).
+        disambiguate: use the LLM disambiguation step to pick the primary NCD (gap
+            analysis), vs the deterministic vote (Policy Q&A).
     """
     # Lazy import to avoid a circular dependency (pipeline imports this lazily too).
     from src.rag.pipeline import (
         PIPELINE_CONFIG,
+        _full_lcd_docs,
         _full_ncd_docs,
+        _hybrid_retrieve_lcd,
         _hybrid_retrieve_ncd,
         _rerank_scored,
         _select_primary_ncds,
     )
+    top_n = PIPELINE_CONFIG["reranker_top_n"]
 
     # ── NCD first ────────────────────────────────────────────────────────────
-    reranked = _rerank_scored(
-        question, _hybrid_retrieve_ncd(question, PIPELINE_CONFIG["k"]),
-        top_n=PIPELINE_CONFIG["reranker_top_n"],
-    )
-    top_sig = 1.0 / (1.0 + math.exp(-reranked[0][0])) if reranked else 0.0
-    if reranked and top_sig >= SILENT_GATE:
+    reranked = _rerank_scored(question, _hybrid_retrieve_ncd(question, PIPELINE_CONFIG["k"]), top_n=top_n)
+    if reranked and _sigmoid(reranked[0][0]) >= SILENT_GATE:
         primary = _select_primary_ncds(reranked, question=question if disambiguate else None)
         if primary:
             docs = [d for n in primary for d in _full_ncd_docs(n)]
@@ -103,7 +106,7 @@ def resolve_governing_policy(
                 )
             # NCD exists but defers to local contractors → fall through to LCD
 
-    # ── LCD fallback (jurisdictional, live) ──────────────────────────────────
+    # ── LCD fallback (jurisdictional, RAG over indexed LCD bodies) ────────────
     code = extract_state(question) or extract_state(state or "") \
         or (state.strip().upper() if state else "")
     if not code:
@@ -111,22 +114,16 @@ def resolve_governing_policy(
     mac = resolve_mac(code)
     if not mac:
         return ResolvedPolicy(source="none", note="unsupported_jurisdiction")
-    try:
-        matches = lcd_lookup(mac, _service_term(question, code))
-    except LcdLookupError as e:
-        logger.warning("LCD lookup failed: %s", e)
-        return ResolvedPolicy(source="none", mac=mac, note="lookup_failed")
-    if not matches:
+
+    lcd_q = _denoise(question, code)
+    lcd_ranked = _rerank_scored(
+        lcd_q, _hybrid_retrieve_lcd(lcd_q, PIPELINE_CONFIG["k"], mac), top_n=top_n)
+    if not lcd_ranked or _sigmoid(lcd_ranked[0][0]) < LCD_GATE:
         return ResolvedPolicy(source="none", mac=mac, note="no_determination")
 
-    lcd_docs = [
-        Document(page_content=m.text, metadata={
-            "source": "LCD", "policy_number": m.lcd_id, "title": m.title,
-            "contractor": m.contractor,
-        })
-        for m in matches
-    ]
+    top_lcd = lcd_ranked[0][1].metadata.get("policy_number", "")
+    docs = _full_lcd_docs(top_lcd, mac)  # whole-LCD context for the governing LCD
     return ResolvedPolicy(
-        source="lcd", policy_docs=lcd_docs, policy_ids=[m.lcd_id for m in matches],
-        title=matches[0].title, mac=mac,
+        source="lcd", policy_docs=docs, policy_ids=[top_lcd],
+        title=docs[0].metadata.get("title", "") if docs else "", mac=mac,
     )

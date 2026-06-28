@@ -19,3 +19,7 @@ data/_*.log
 
 # scripts — keep reusable tooling (*.py), ignore large per-run review dumps
 scripts/_*.txt
+
+# Vector index — regenerable build artifact, too large for git (rebuild via
+# src.rag.indexer + src.rag.pubmed_indexer)
+data/chroma/
