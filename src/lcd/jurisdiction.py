@@ -31,6 +31,17 @@ NGS = "National Government Services, Inc."
 
 SUPPORTED_MACS: tuple[str, ...] = (NORIDIAN, CGS, WPS, PALMETTO, NGS)
 
+# Short slug per MAC for boolean index metadata (`mac_<key>: True`), so an LCD
+# served by several MACs is stored ONCE with multiple flags — no duplication.
+_MAC_KEYS: dict[str, str] = {
+    NORIDIAN: "noridian", CGS: "cgs", WPS: "wps", PALMETTO: "palmetto", NGS: "ngs",
+}
+
+
+def mac_key(mac: str) -> str:
+    """Slug for a MAC contractor name, used as the `mac_<key>` metadata flag."""
+    return _MAC_KEYS.get(mac, "")
+
 # State / territory (USPS code) -> MAC contractor, for the 5 in-scope MACs only.
 STATE_TO_MAC: dict[str, str] = {
     # Noridian — JE + JF

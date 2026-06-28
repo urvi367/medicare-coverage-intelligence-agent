@@ -136,8 +136,10 @@ def _hybrid_retrieve_lcd(query: str, k: int, mac: str) -> list[Document]:
     beneficiary's MAC via metadata — so a query reaches the right LCD by content,
     not by its (often broad) title.
     """
+    from src.lcd.jurisdiction import mac_key
     db = _get_db()
-    flt = {"$and": [{"source": "LCD"}, {"mac": mac}]}
+    flag = f"mac_{mac_key(mac)}"
+    flt = {"$and": [{"source": "LCD"}, {flag: True}]}
     # Plain top-k (no score threshold): a short clinical query vs a long LCD body often
     # scores below the policy-QA 0.65 cosine cut, so let the cross-encoder gate instead.
     dense_docs = db.as_retriever(
@@ -145,7 +147,7 @@ def _hybrid_retrieve_lcd(query: str, k: int, mac: str) -> list[Document]:
     ).invoke(query)
     bm25_docs = [
         d for d in _get_bm25(k).invoke(query)
-        if d.metadata.get("source") == "LCD" and d.metadata.get("mac") == mac
+        if d.metadata.get("source") == "LCD" and d.metadata.get(flag)
     ]
 
     scores: dict[str, float] = {}
@@ -163,10 +165,10 @@ def _hybrid_retrieve_lcd(query: str, k: int, mac: str) -> list[Document]:
     return [doc_map[k_] for k_ in ranked[:k]]
 
 
-def _full_lcd_docs(lcd_id: str, mac: str) -> list[Document]:
-    """Return all indexed chunks for one LCD in one MAC (whole-LCD context)."""
+def _full_lcd_docs(lcd_id: str) -> list[Document]:
+    """Return all indexed chunks for one LCD (whole-LCD context). One copy per LCD."""
     got = _get_db().get(
-        where={"$and": [{"policy_number": lcd_id}, {"mac": mac}]},
+        where={"policy_number": lcd_id},
         include=["documents", "metadatas"],
     )
     return [

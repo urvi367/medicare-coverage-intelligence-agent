@@ -122,7 +122,7 @@ def resolve_governing_policy(
         return ResolvedPolicy(source="none", mac=mac, note="no_determination")
 
     top_lcd = lcd_ranked[0][1].metadata.get("policy_number", "")
-    docs = _full_lcd_docs(top_lcd, mac)  # whole-LCD context for the governing LCD
+    docs = _full_lcd_docs(top_lcd)  # whole-LCD context for the governing LCD
     return ResolvedPolicy(
         source="lcd", policy_docs=docs, policy_ids=[top_lcd],
         title=docs[0].metadata.get("title", "") if docs else "", mac=mac,

@@ -16,6 +16,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 from src.lcd.jurisdiction import SUPPORTED_MACS as _SUPPORTED_MACS
+from src.lcd.jurisdiction import mac_key as _mac_key
 
 BASE = "https://api.coverage.cms.gov/v1"
 DATA_DIR = Path(__file__).parents[2] / "data"
@@ -222,17 +223,19 @@ def load_documents(doc_type: str) -> list[dict[str, str]]:
         if doc_type != "lcd":
             docs.append(base)
             continue
-        # LCDs are jurisdictional: skip retired, tag each with the serving in-scope
-        # MAC(s). Emit one doc per MAC so `mac` stays scalar for exact Chroma filtering
-        # (a few LCDs are shared across MACs).
+        # LCDs are jurisdictional: skip retired, and tag with the serving in-scope
+        # MAC(s) as boolean `mac_<key>` flags — ONE doc per LCD even when shared across
+        # MACs (no duplication; Chroma metadata is scalar so a list won't filter).
         if (r.get("retirement_date") or "N/A").strip() != "N/A":
             continue
         contractor = r.get("contractor_name_type", "") or ""
         serving = [m for m in _SUPPORTED_MACS if m in contractor]
         if not serving:
             continue
-        for mac in serving:
-            docs.append({**base, "contractor": contractor.splitlines()[0].strip(), "mac": mac})
+        base["contractor"] = contractor.splitlines()[0].strip()
+        for m in serving:
+            base[f"mac_{_mac_key(m)}"] = True
+        docs.append(base)
 
     return docs
 

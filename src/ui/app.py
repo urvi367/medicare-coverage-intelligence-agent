@@ -10,8 +10,6 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from src.rag.pipeline import answer, gap_analysis
-from src.lcd.jurisdiction import extract_state
-from src.lcd.orchestrator import run_coverage_query
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -55,27 +53,13 @@ _POLICY_SIGNALS = re.compile(
 )
 
 
-# Jurisdictional signals → dynamic NCD→LCD coverage path (Phase 3). A LCD is
-# jurisdictional, so an explicit state or local-coverage cue routes to the agentic
-# coverage loop (which resolves NCD vs the state's MAC LCD, asking for state if needed).
-_COVERAGE_SIGNALS = re.compile(
-    r"\b(lcd|local\s+coverage|jurisdiction|mac\b|contractor|"
-    r"in\s+my\s+state|my\s+state|which\s+state|by\s+state|in\s+my\s+(region|area))\b",
-    re.IGNORECASE,
-)
-
-
 def _route(query: str) -> str:
-    """Return 'gap', 'coverage', or 'policy' based on query signals."""
+    """Return 'gap' or 'policy'. Both run the NCD→LCD cascade internally, so a
+    jurisdictional question (mentions a state) just routes to whichever of Policy
+    Q&A / Gap Analysis fits — the cascade handles NCD-vs-LCD and the state ask."""
     gap_score = len(_GAP_SIGNALS.findall(query))
     policy_score = len(_POLICY_SIGNALS.findall(query))
-    # Gap analysis only when evidence signals clearly dominate
-    if gap_score > 0 and gap_score >= policy_score:
-        return "gap"
-    # Jurisdictional coverage question → dynamic NCD→LCD loop
-    if extract_state(query) or _COVERAGE_SIGNALS.search(query):
-        return "coverage"
-    return "policy"
+    return "gap" if gap_score > 0 and gap_score >= policy_score else "policy"
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -209,42 +193,48 @@ def _pubmed_source_meta(docs) -> list[dict]:
     ]
 
 
-_MODE_TAG = {
-    "gap": "Evidence Gap Analysis",
-    "policy": "Policy Q&A",
-    "coverage": "Coverage (NCD → LCD)",
-}
+_MODE_TAG = {"gap": "Evidence Gap Analysis", "policy": "Policy Q&A"}
 
 
-def _render_trace(trace: list[dict]) -> None:
-    """Show the agentic resolution path (which tools fired and what they returned)."""
-    if not trace:
-        return
-    with st.expander("How this was resolved"):
-        for step in trace:
-            st.markdown(f"- `{step['tool']}` → **{step['result']}**")
+def _run(mode: str, question: str, state: str | None = None) -> None:
+    """Run Policy Q&A or Gap Analysis (each does the NCD→LCD cascade), render it,
+    and handle the multi-turn state ask: when the cascade needs the beneficiary's
+    state, remember the question so the next message continues it."""
+    try:
+        if mode == "policy":
+            with st.spinner("Resolving coverage (NCD → LCD)..."):
+                result = answer(question, state=state)
+            st.markdown(result["answer"])
+            sources = _source_meta(result["sources"])
+            if sources:
+                _render_sources(sources)
+            msg = {"role": "assistant", "content": result["answer"], "sources": sources}
+            log_args = (question, result["answer"], result["sources"])
+        else:  # gap
+            with st.spinner("Retrieving CMS policy and PubMed evidence..."):
+                result = gap_analysis(question, state=state)
+            st.markdown(result["gap_report"])
+            policy_sources = _source_meta(result["policy_sources"])
+            pubmed_sources = _pubmed_source_meta(result["pubmed_sources"])
+            if policy_sources:
+                _render_sources(policy_sources, "CMS Policy Sources")
+            if pubmed_sources:
+                _render_sources(pubmed_sources, "PubMed Evidence")
+            msg = {"role": "assistant", "content": result["gap_report"],
+                   "policy_sources": policy_sources, "pubmed_sources": pubmed_sources}
+            log_args = (question, result["gap_report"], result["policy_sources"])
+    except RuntimeError as e:
+        st.error(str(e))
+        st.stop()
 
-
-def _handle_coverage(query: str, state: str | None = None) -> None:
-    """Run the dynamic NCD→LCD coverage loop and render it, incl. the multi-turn state ask."""
-    with st.spinner("Resolving coverage (NCD → LCD)..."):
-        try:
-            result = run_coverage_query(query, state=state)
-        except RuntimeError as e:
-            st.error(str(e))
-            st.stop()
-    st.markdown(result["answer"])
-    _render_trace(result.get("trace", []))
-    # If the loop needs the beneficiary's state, remember the question so the next
-    # message (the state) continues this same query.
     if result.get("needs_state"):
-        st.session_state.pending_coverage = query
-    new_index = len(st.session_state.messages)
-    _render_feedback(new_index, query, mode="coverage")
-    st.session_state.messages.append(
-        {"role": "assistant", "content": result["answer"], "trace": result.get("trace", [])}
-    )
-    _log_interaction(query, result["answer"], [], mode="coverage")
+        st.session_state.pending = {"question": question, "mode": mode}
+    _render_feedback(len(st.session_state.messages), question, mode=mode)
+    st.session_state.messages.append(msg)
+    if mode == "gap":
+        _log_interaction(*log_args, mode="gap", pubmed_sources=result["pubmed_sources"])
+    else:
+        _log_interaction(*log_args, mode="policy")
 
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -257,9 +247,9 @@ st.set_page_config(
 
 st.title("Medicare Coverage Intelligence Agent")
 st.caption(
-    "Ask about Medicare coverage, request an evidence gap analysis, or check "
-    "jurisdiction-specific coverage (mention a state for a live LCD lookup) — "
-    "routing is automatic based on your question."
+    "Ask about Medicare coverage or request an evidence gap analysis. Coverage "
+    "falls back from the national NCD to your state's LCD — mention a state for "
+    "jurisdiction-specific answers. Routing is automatic."
 )
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -268,8 +258,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "feedback" not in st.session_state:
     st.session_state.feedback = {}
-if "pending_coverage" not in st.session_state:
-    st.session_state.pending_coverage = None
+if "pending" not in st.session_state:
+    st.session_state.pending = None
 
 # ── Render history ────────────────────────────────────────────────────────────
 
@@ -284,8 +274,6 @@ for i, msg in enumerate(st.session_state.messages):
             _render_sources(msg["pubmed_sources"], "PubMed Evidence")
         if msg.get("sources"):
             _render_sources(msg["sources"])
-        if msg.get("trace"):
-            _render_trace(msg["trace"])
         if msg["role"] == "assistant":
             question = st.session_state.messages[i - 1]["content"] if i > 0 else ""
             msg_mode = st.session_state.messages[i - 1].get("mode", "") if i > 0 else ""
@@ -294,13 +282,13 @@ for i, msg in enumerate(st.session_state.messages):
 # ── Handle new input ──────────────────────────────────────────────────────────
 
 if prompt := st.chat_input("Ask a coverage question or request an evidence gap analysis..."):
-    pending = st.session_state.pending_coverage
-    st.session_state.pending_coverage = None
+    pending = st.session_state.pending
+    st.session_state.pending = None
     if pending:
-        # This message answers a prior "which state?" — continue that coverage query.
-        mode, coverage_query = "coverage", pending
+        # This message answers a prior "which state?" — continue that query.
+        mode, question, state = pending["mode"], pending["question"], prompt
     else:
-        mode, coverage_query = _route(prompt), prompt
+        mode, question, state = _route(prompt), prompt, None
     st.session_state.messages.append({"role": "user", "content": prompt, "mode": mode})
 
     with st.chat_message("user"):
@@ -308,48 +296,4 @@ if prompt := st.chat_input("Ask a coverage question or request an evidence gap a
         st.caption(f"Routed to: {_MODE_TAG[mode]}")
 
     with st.chat_message("assistant"):
-        if mode == "policy":
-            with st.spinner("Retrieving policy documents..."):
-                try:
-                    result = answer(prompt)
-                except RuntimeError as e:
-                    st.error(str(e))
-                    st.stop()
-
-            st.markdown(result["answer"])
-            sources = _source_meta(result["sources"])
-            _render_sources(sources)
-            new_index = len(st.session_state.messages)
-            _render_feedback(new_index, prompt, mode="policy")
-
-            st.session_state.messages.append(
-                {"role": "assistant", "content": result["answer"], "sources": sources}
-            )
-            _log_interaction(prompt, result["answer"], result["sources"], mode="policy")
-
-        elif mode == "coverage":
-            _handle_coverage(coverage_query, state=prompt if pending else None)
-
-        else:
-            with st.spinner("Retrieving CMS policy and PubMed evidence..."):
-                try:
-                    result = gap_analysis(prompt)
-                except RuntimeError as e:
-                    st.error(str(e))
-                    st.stop()
-
-            st.markdown(result["gap_report"])
-            policy_sources = _source_meta(result["policy_sources"])
-            pubmed_sources = _pubmed_source_meta(result["pubmed_sources"])
-            _render_sources(policy_sources, "CMS Policy Sources")
-            _render_sources(pubmed_sources, "PubMed Evidence")
-            new_index = len(st.session_state.messages)
-            _render_feedback(new_index, prompt, mode="gap")
-
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": result["gap_report"],
-                "policy_sources": policy_sources,
-                "pubmed_sources": pubmed_sources,
-            })
-            _log_interaction(prompt, result["gap_report"], result["policy_sources"], mode="gap", pubmed_sources=result["pubmed_sources"])
+        _run(mode, question, state)
