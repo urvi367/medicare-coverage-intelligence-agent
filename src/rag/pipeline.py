@@ -5,6 +5,7 @@ import math
 import random
 import re
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
 from dotenv import load_dotenv
@@ -136,7 +137,6 @@ def _hybrid_retrieve_lcd(query: str, k: int, mac: str) -> list[Document]:
     beneficiary's MAC via metadata — so a query reaches the right LCD by content,
     not by its (often broad) title.
     """
-    from src.lcd.jurisdiction import mac_key
     db = _get_db()
     flag = f"mac_{mac_key(mac)}"
     flt = {"$and": [{"source": "LCD"}, {flag: True}]}
@@ -192,6 +192,18 @@ def _pubmed_for_ncds(query: str, ncd_numbers: set[str], k: int) -> list[Document
     nums = list(ncd_numbers)
     flt = {"source_ncd_number": nums[0]} if len(nums) == 1 else {"source_ncd_number": {"$in": nums}}
     return db.similarity_search(query, k=k, filter=flt)
+
+
+def _pubmed_for_lcd(query: str, lcd_id: str, k: int) -> list[Document]:
+    """Topical PubMed retrieval for one LCD (abstracts fetched for that LCD's topic),
+    mirroring _pubmed_for_ncds. Empty until fetch_lcd_evidence has been run."""
+    if not lcd_id:
+        return []
+    try:
+        db = _get_pubmed_db()
+    except RuntimeError:
+        return []
+    return db.similarity_search(query, k=k, filter={"source_lcd_number": lcd_id})
 
 
 def _rerank_scored(query: str, docs: list[Document], top_n: int) -> list[tuple[float, Document]]:
@@ -407,6 +419,198 @@ def _retryable(exc: BaseException) -> bool:
                                   "resource exhausted", "service unavailable"))
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  Jurisdiction routing & the NCD→LCD coverage cascade
+#
+#  Coverage resolves NCD-first, then falls back to the beneficiary's MAC LCD.
+#  Scoped to FIVE MACs (Noridian, CGS, WPS, Palmetto, NGS); states served by
+#  out-of-scope MACs resolve to None and are reported, not guessed. Routing is
+#  deterministic (state→MAC table, defer-marker, relevance gates); LCD retrieval
+#  is body-based RAG, like NCDs.
+# ════════════════════════════════════════════════════════════════════════════
+
+# MAC contractor names exactly as they appear in `contractor_name_type`.
+NORIDIAN = "Noridian Healthcare Solutions, LLC"
+CGS = "CGS Administrators, LLC"
+WPS = "WPS Insurance Corporation"
+PALMETTO = "Palmetto GBA"
+NGS = "National Government Services, Inc."
+SUPPORTED_MACS: tuple[str, ...] = (NORIDIAN, CGS, WPS, PALMETTO, NGS)
+
+# Slug per MAC for boolean index metadata (`mac_<key>: True`) — an LCD served by
+# several MACs is stored once with multiple flags (no duplication).
+_MAC_KEYS = {NORIDIAN: "noridian", CGS: "cgs", WPS: "wps", PALMETTO: "palmetto", NGS: "ngs"}
+
+# State / territory (USPS code) → MAC, for the 5 in-scope MACs only.
+STATE_TO_MAC: dict[str, str] = {
+    **{s: NORIDIAN for s in ("AK", "AZ", "CA", "HI", "ID", "MT", "ND", "NV",
+                             "OR", "SD", "UT", "WA", "WY", "AS", "GU", "MP")},
+    **{s: CGS for s in ("KY", "OH")},
+    **{s: WPS for s in ("IA", "IN", "KS", "MI", "MO", "NE")},
+    **{s: PALMETTO for s in ("AL", "GA", "NC", "SC", "TN", "VA", "WV")},
+    **{s: NGS for s in ("CT", "IL", "MA", "ME", "MN", "NH", "NY", "RI", "VT", "WI")},
+}
+
+# Full state names → USPS code, for extracting a state from free-text queries.
+_STATE_NAMES: dict[str, str] = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA", "west virginia": "WV",
+    "wisconsin": "WI", "wyoming": "WY", "district of columbia": "DC", "puerto rico": "PR",
+}
+_VALID_CODES = set(_STATE_NAMES.values())
+_CODE_RE = re.compile(r"\b([A-Z]{2})\b")  # whole-word USPS code (avoids "IN"/"OR" in words)
+
+# High-precision markers that an NCD has no national determination / hands the
+# decision to the local MAC. Narrow on purpose: a passing mention of "MAC" is not a defer.
+_DEFER_RE = re.compile(
+    r"no national coverage determination"
+    r"|there is no ncd\b"
+    r"|coverage determinations?\s+(?:will be|are)\s+made by the (?:local )?medicare administrative contractor"
+    r"|at the discretion of the (?:local )?medicare administrative contractor"
+    r"|left to the discretion of the (?:local|medicare administrative contractor)"
+    r"|determined by the local medicare",
+    re.I,
+)
+
+# Top reranked-chunk sigmoid below these ⇒ nothing on-topic governs.
+SILENT_GATE = 0.60   # NCD side (governed ~0.73 vs LCD-only ~0.55)
+LCD_GATE = 0.55      # LCD side: no MAC LCD relevant enough → contractor discretion
+
+# Coverage/evidence-question framing stripped before LCD retrieval — LCD bodies share
+# heavy "covered…patient…medically necessary" boilerplate, so a noisy query matches the
+# wrong LCD; denoising to the clinical term fixes it (still a body match, not title match).
+_QNOISE = re.compile(
+    r"\b(is|are|was|were|does|do|did|can|could|will|would|should|has|have|cover|covered|"
+    r"coverage|covers|for|my|the|a|an|to|in|of|on|under|when|whether|if|patient|patients|"
+    r"beneficiary|medicare|cms|reimburse|reimbursed|eligible|service|please|this|that|"
+    r"there|any|state|jurisdiction|region|area|local|lcd|ncd|what|whats|evidence|show|"
+    r"shows|support|supports|supported|about|data|research|study|studies|literature|"
+    r"clinical|effective|effectiveness|patient's)\b",
+    re.IGNORECASE,
+)
+
+
+def mac_key(mac: str) -> str:
+    """Slug for a MAC contractor name, used as the `mac_<key>` metadata flag."""
+    return _MAC_KEYS.get(mac, "")
+
+
+def extract_state(query: str) -> str | None:
+    """Best-effort extract a USPS state code from free text (full names, then codes),
+    else None — the cascade uses None to decide whether to ASK the user for a state."""
+    low = query.lower()
+    for name, code in _STATE_NAMES.items():
+        if re.search(rf"\b{re.escape(name)}\b", low):
+            return code
+    for m in _CODE_RE.findall(query):
+        if m in _VALID_CODES:
+            return m
+    return None
+
+
+def resolve_mac(state: str | None) -> str | None:
+    """Map a USPS state code to its MAC contractor (matching the LCD data). None when
+    missing/unknown or served by an out-of-scope MAC — reported rather than guessed."""
+    return STATE_TO_MAC.get(state.strip().upper()) if state else None
+
+
+def ncd_disposition(ncd_text: str | None) -> str:
+    """How the (deterministically selected) NCD treats a service: "silent" (no NCD →
+    escalate to LCD), "defers" (NCD hands coverage to the local MAC → escalate), or
+    "governs" (national determination → use it)."""
+    if not ncd_text or not ncd_text.strip():
+        return "silent"
+    return "defers" if _DEFER_RE.search(ncd_text) else "governs"
+
+
+def _denoise(question: str, state_code: str) -> str:
+    """Strip the state mention + coverage/evidence-question framing → clinical term."""
+    s = question
+    for name, code in _STATE_NAMES.items():
+        if code == state_code:
+            s = re.sub(rf"\b{re.escape(name)}\b", " ", s, flags=re.IGNORECASE)
+    if state_code:
+        s = re.sub(rf"\b{re.escape(state_code)}\b", " ", s)
+    s = _QNOISE.sub(" ", s)
+    s = re.sub(r"[^\w\s./-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s or question
+
+
+@dataclass
+class ResolvedPolicy:
+    """The single governing policy for a question (or none)."""
+    source: str                                   # "ncd" | "lcd" | "none"
+    policy_docs: list[Document] = field(default_factory=list)
+    policy_ids: list[str] = field(default_factory=list)
+    title: str = ""
+    mac: str | None = None
+    needs_state: bool = False
+    # for source == "none": why — need_state | unsupported_jurisdiction | no_determination
+    note: str = ""
+
+
+def resolve_governing_policy(
+    question: str, state: str | None = None, disambiguate: bool = False
+) -> ResolvedPolicy:
+    """Resolve the one governing policy via the NCD→LCD cascade — the shared resolution
+    step for both answer() and gap_analysis().
+
+    NCD governs → return it. NCD silent/defers → the beneficiary's MAC LCD (RAG over
+    indexed bodies; asks for state if unknown). Neither → none. `disambiguate` uses the
+    LLM NCD picker (gap analysis) vs the deterministic vote (Policy Q&A).
+    """
+    top_n = PIPELINE_CONFIG["reranker_top_n"]
+
+    # ── NCD first ────────────────────────────────────────────────────────────
+    reranked = _rerank_scored(question, _hybrid_retrieve_ncd(question, PIPELINE_CONFIG["k"]), top_n=top_n)
+    if reranked and _sigmoid(reranked[0][0]) >= SILENT_GATE:
+        primary = _select_primary_ncds(reranked, question=question if disambiguate else None)
+        if primary:
+            docs = [d for n in primary for d in _full_ncd_docs(n)]
+            if ncd_disposition("\n".join(d.page_content for d in docs)) == "governs":
+                return ResolvedPolicy(
+                    source="ncd", policy_docs=docs, policy_ids=list(primary),
+                    title=docs[0].metadata.get("title", "") if docs else "",
+                )
+            # NCD exists but defers to local contractors → fall through to LCD
+
+    # ── LCD fallback (jurisdictional, RAG over indexed LCD bodies) ────────────
+    code = extract_state(question) or extract_state(state or "") \
+        or (state.strip().upper() if state else "")
+    if not code:
+        return ResolvedPolicy(source="none", needs_state=True, note="need_state")
+    mac = resolve_mac(code)
+    if not mac:
+        return ResolvedPolicy(source="none", note="unsupported_jurisdiction")
+
+    lcd_q = _denoise(question, code)
+    lcd_ranked = _rerank_scored(lcd_q, _hybrid_retrieve_lcd(lcd_q, PIPELINE_CONFIG["k"], mac), top_n=top_n)
+    if not lcd_ranked or _sigmoid(lcd_ranked[0][0]) < LCD_GATE:
+        return ResolvedPolicy(source="none", mac=mac, note="no_determination")
+
+    top_lcd = lcd_ranked[0][1].metadata.get("policy_number", "")
+    docs = _full_lcd_docs(top_lcd)  # whole-LCD context for the governing LCD
+    return ResolvedPolicy(
+        source="lcd", policy_docs=docs, policy_ids=[top_lcd],
+        title=docs[0].metadata.get("title", "") if docs else "", mac=mac,
+    )
+
+
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+
 def _no_policy_message(note: str, needs_state: bool) -> str:
     """User-facing message when the NCD→LCD cascade finds no governing policy."""
     if needs_state:
@@ -437,7 +641,6 @@ def answer(
 
     Returns {answer, sources, needs_state}.
     """
-    from src.lcd.resolve import resolve_governing_policy
 
     resolved = resolve_governing_policy(question, state=state)
     if resolved.source == "none":
@@ -618,23 +821,6 @@ def _format_pubmed_docs(docs: list[Document]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
-def _pubmed_semantic(query: str, k: int) -> list[Document]:
-    """Dense semantic search over the pubmed_evidence index (no NCD topical filter).
-
-    Used for LCD gap analysis: an LCD has no source_ncd_number to topical-join on, so
-    evidence is retrieved by RAG over the same index — consistent with the NCD path,
-    not a live fetch. (May be sparse until PubMed ingestion is extended to LCD topics.)
-    """
-    try:
-        db = _get_pubmed_db()
-    except RuntimeError:
-        logger.warning("PubMed index not found — run fetch_pubmed + pubmed_indexer first")
-        return []
-    docs = db.similarity_search(query, k=k)
-    docs.sort(key=lambda d: d.metadata.get("year", "0"), reverse=True)
-    return docs
-
-
 def gap_analysis(
     question: str,
     model: str = "gemini-2.5-flash",
@@ -646,7 +832,6 @@ def gap_analysis(
 
     Returns {gap_report, policy_sources, pubmed_sources, needs_state}.
     """
-    from src.lcd.resolve import resolve_governing_policy
 
     resolved = resolve_governing_policy(question, state=state, disambiguate=True)
     if resolved.source == "none":
@@ -668,8 +853,9 @@ def gap_analysis(
         except RuntimeError:
             logger.warning("PubMed index not found — run fetch_pubmed + pubmed_indexer first")
             pubmed_docs = []
-    else:  # lcd — no NCD to topical-join on, so retrieve evidence by RAG over the index
-        pubmed_docs = _pubmed_semantic(question, PIPELINE_CONFIG["pubmed_k"])
+    else:  # lcd — topical join on the governing LCD's own fetched evidence
+        lcd_id = resolved.policy_ids[0] if resolved.policy_ids else ""
+        pubmed_docs = _pubmed_for_lcd(question, lcd_id, PIPELINE_CONFIG["pubmed_k"])
 
     policy_context = _format_docs(policy_docs) if policy_docs else "No CMS policy documents retrieved."
     pubmed_context = _format_pubmed_docs(pubmed_docs)

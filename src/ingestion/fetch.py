@@ -15,9 +15,6 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-from src.lcd.jurisdiction import SUPPORTED_MACS as _SUPPORTED_MACS
-from src.lcd.jurisdiction import mac_key as _mac_key
-
 BASE = "https://api.coverage.cms.gov/v1"
 DATA_DIR = Path(__file__).parents[2] / "data"
 PAGE_SIZE = 100
@@ -228,13 +225,15 @@ def load_documents(doc_type: str) -> list[dict[str, str]]:
         # MACs (no duplication; Chroma metadata is scalar so a list won't filter).
         if (r.get("retirement_date") or "N/A").strip() != "N/A":
             continue
+        # lazy import: ingestion → pipeline at module top would be circular
+        from src.rag.pipeline import SUPPORTED_MACS, mac_key
         contractor = r.get("contractor_name_type", "") or ""
-        serving = [m for m in _SUPPORTED_MACS if m in contractor]
+        serving = [m for m in SUPPORTED_MACS if m in contractor]
         if not serving:
             continue
         base["contractor"] = contractor.splitlines()[0].strip()
         for m in serving:
-            base[f"mac_{_mac_key(m)}"] = True
+            base[f"mac_{mac_key(m)}"] = True
         docs.append(base)
 
     return docs

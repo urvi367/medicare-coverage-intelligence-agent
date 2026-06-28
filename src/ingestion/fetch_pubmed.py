@@ -337,8 +337,42 @@ def load_documents() -> list[dict[str, str]]:
             "study_type": r.get("study_type", ""),
             "source_ncd_title": r.get("source_ncd_title", ""),
             "source_ncd_number": r.get("source_ncd_number", ""),
+            "source_lcd_title": r.get("source_lcd_title", ""),
+            "source_lcd_number": r.get("source_lcd_number", ""),
         })
     return docs
+
+
+def fetch_lcd_evidence(max_per_topic: int = 8) -> Path:
+    """Fetch PubMed evidence per active LCD topic (by title) and APPEND to
+    pubmed_raw.json, tagged with source_lcd_number — so LCD gap analysis has topical
+    evidence the same way NCDs do (filtered topical join, not open search). Idempotent:
+    drops any prior LCD-sourced records first.
+
+    Note: LCD titles are broader than NCD intervention names (e.g. "Plastic Surgery"),
+    so the evidence is correspondingly broader than the NCD corpus.
+    """
+    lcds = json.loads((DATA_DIR / "lcd_raw.json").read_text(encoding="utf-8"))
+    topics: dict[str, str] = {}
+    for r in lcds:
+        did = r.get("document_display_id")
+        if did and r.get("title") and (r.get("retirement_date") or "N/A").strip() == "N/A":
+            topics[did] = r["title"]
+    logger.info("Fetching PubMed for %d LCD topics (max %d each)...", len(topics), max_per_topic)
+
+    path = DATA_DIR / "pubmed_raw.json"
+    records = json.loads(path.read_text(encoding="utf-8"))
+    records = [r for r in records if not r.get("source_lcd_number")]  # idempotent re-run
+
+    for i, (lcd_id, title) in enumerate(topics.items(), 1):
+        if i % 50 == 0:
+            logger.info("  ...%d/%d LCD topics", i, len(topics))
+        for rec in _fetch_abstracts(_search_topic_pmids(title, max_per_topic)):
+            records.append({**rec, "source_lcd_title": title, "source_lcd_number": lcd_id})
+
+    path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+    logger.info("Saved %d total PubMed records (NCD + LCD) to %s", len(records), path)
+    return path
 
 
 if __name__ == "__main__":
@@ -346,5 +380,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     if "--backfill" in sys.argv:
         backfill_metadata()  # patch year + study_type onto existing data, no re-search
+    elif "--lcd" in sys.argv:
+        fetch_lcd_evidence()  # append LCD-topic evidence to the corpus
     else:
         fetch_and_save()
