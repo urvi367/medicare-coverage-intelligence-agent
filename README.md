@@ -1,13 +1,47 @@
 # Medicare Coverage Intelligence Platform
 
-A retrieval system over CMS coverage policy and the clinical literature that answers two questions for provider revenue-cycle teams:
+A retrieval system over CMS coverage policy and the clinical literature that resolves Medicare coverage the way it actually works — **national first, then jurisdictional** — and flags where coverage diverges from the evidence.
 
-1. **"What does Medicare cover, and under what criteria?"** — grounded, cited answers from CMS National and Local Coverage Determinations (NCDs/LCDs), for **denial *prevention*** at prior-auth time.
-2. **"Where is CMS coverage out of step with the published evidence?"** — a structured, PMID-cited gap report comparing each NCD against PubMed, for **denial *appeals*** ("not medically necessary" / "experimental").
+Two capabilities for provider revenue-cycle teams, both driven by one **NCD→LCD coverage cascade**:
 
-The UI auto-routes each question to the right path by regex signal scoring — no manual mode toggle.
+1. **Policy Q&A** — "Is this covered, and under what criteria?" An NCD governs nationally; if there's no NCD (or it defers to local contractors), coverage falls back to the beneficiary's **MAC jurisdiction LCD**. For denial *prevention* at prior-auth.
+2. **Evidence Gap Analysis** — "Where is coverage out of step with the published evidence?" The governing policy (NCD *or* LCD) is compared against PubMed, with a PMID-cited gap report. For denial *appeals*.
+
+Routing is automatic; jurisdictional questions (mention a state) flow through the same cascade, which asks for the state when it needs one.
 
 Prototype: https://medicare-coverage-agent.streamlit.app/
+
+---
+
+## The coverage cascade (Phase 3)
+
+LCDs are **jurisdictional** (one MAC contractor per region) and too numerous/variable to treat like NCDs, so coverage resolves in a deterministic cascade — the shared resolution step both Policy Q&A and Gap Analysis call:
+
+```
+question (+ optional state)
+  │
+  ▼  retrieve + rerank NCDs
+ Is there an NCD, and does it GOVERN?
+  ├─ governs            → answer/gap from the national NCD                ✅ done
+  └─ silent / defers-to-MAC
+        │
+        ▼  state → MAC  (deterministic table; ask the user if unknown)
+     Resolve the beneficiary's MAC jurisdiction
+        ├─ out-of-scope MAC → report (not guessed)
+        └─ in-scope MAC
+              ▼  RAG over that MAC's LCD bodies (jurisdiction-filtered)
+           Is a relevant LCD found?
+              ├─ yes → answer/gap from the live-indexed LCD
+              └─ no  → "no determination → contractor discretion"
+```
+
+- **NCD-first, deterministic.** Whether an NCD governs is a relevance gate + a defer-marker check (`ncd_disposition`: governs / defers / silent). `state → MAC` is a static table. Only the final answer/gap reasoning is generative.
+- **Jurisdiction-aware.** Scoped to **5 MACs** — Noridian, CGS, WPS, Palmetto, National Government Services (the best-represented). States served by out-of-scope MACs are reported as unsupported, never guessed.
+- **Multi-turn.** If the cascade needs the beneficiary's state and the question didn't include one, it asks; the next message continues the query.
+
+### LCDs are body-based RAG, not titles
+
+An earlier design matched questions to LCD *titles* and fetched them live — it failed because **questions don't carry LCD titles** ("panniculectomy" vs an LCD titled "Plastic Surgery"). So LCDs are now **indexed like NCDs**: the indications/limitations **body** is chunked (title-prepend + synonym expansion), tagged with **boolean `mac_<key>` flags** (one doc per LCD, even when shared across MACs — no duplication). Retrieval is body-based semantic search **filtered to the beneficiary's MAC**, so a query reaches the right LCD by *content*. Retired LCDs are excluded (a retired determination can't drive coverage).
 
 ---
 
@@ -16,70 +50,45 @@ Prototype: https://medicare-coverage-agent.streamlit.app/
 ```
 ┌──────────────────────────┐        ┌──────────────────────────┐
 │   CMS Coverage API       │        │   PubMed / NCBI          │
-│   NCDs + LCDs            │        │   E-utilities            │
+│   NCDs + LCDs (5 MACs,   │        │   E-utilities            │
+│   active, with body)     │        │   (per NCD & LCD topic)  │
 └────────────┬─────────────┘        └────────────┬─────────────┘
-             │ fetch (8-worker pool,             │ two-pass per-NCD search
-             │ iterative HTML unescape)          │ (primary-evidence first)
              ▼                                   ▼
 ┌──────────────────────────┐        ┌──────────────────────────┐
-│  cms_coverage  (Chroma)  │        │  pubmed_evidence (Chroma)│
-│  1,983 NCD/LCD chunks    │        │  3,219 abstracts /       │
-│  bge-small embeddings    │        │  296 NCD topics, T1–T5   │
-│  title + synonym expand  │        │  tier-graded, ~89% RCT/  │
-│                          │        │  meta/cohort             │
+│  cms_coverage (Chroma)   │        │  pubmed_evidence (Chroma)│
+│  1,483 NCD + 10,668 LCD  │        │  5,735 abstracts         │
+│  chunks; bge embeddings; │        │  (3,219 NCD + 2,516 LCD  │
+│  title+synonym; mac flags│        │  topical, tier-graded)   │
 └────────────┬─────────────┘        └────────────┬─────────────┘
              │                                   │
-   ┌─────────┴──────────┐                        │
-   ▼                    ▼                        │
-┌─────────────────┐  ┌───────────────────────────┴──────────────────┐
-│  POLICY Q&A     │  │              GAP ANALYSIS                      │
-│  (prevention)   │  │              (appeals)                        │
-├─────────────────┤  ├───────────────────────────────────────────────┤
-│ hybrid retrieve │  │ NCD-only hybrid retrieve + cross-encoder rerank│
-│ (BM25+dense,RRF)│  │            │                                   │
-│   │             │  │            ▼  score-weighted vote per NCD      │
-│   ▼             │  │  ┌──────────────────────────────────────────┐ │
-│ bge-reranker    │  │  │ NCD disambiguation: when top candidates  │ │
-│ top-5           │  │  │ score close, one LLM call reads the      │ │
-│   │             │  │  │ question vs candidate titles → picks the │ │
-│   ▼             │  │  │ governing NCD(s), cap 2                   │ │
-│ cited context   │  │  └──────────────────────┬───────────────────┘ │
-│ + LCD juris note│  │            ▼  whole-NCD full text (not chunks) │
-│   │             │  │     topical join → PubMed for that NCD only   │
-│   ▼             │  │            ▼                                   │
-│ gemini-2.5-flash│  │     gemini-2.5-flash → structured gap report  │
-│ → cited answer  │  │     (Coverage Position · Evidence · Grade ·   │
-│                 │  │      Alignment · Gap Summary)                 │
-└────────┬────────┘  └───────────────────────┬───────────────────────┘
-         │                                   │
-         ▼                                   ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  Streamlit UI (auto-routes Q&A vs gap) · JSONL interaction logs   │
-│  Evaluation: judge.py (RAGAS, Policy Q&A) · judge_gap.py (gap)    │
-└──────────────────────────────────────────────────────────────────┘
+             ▼  resolve_governing_policy (NCD→LCD cascade)
+   ┌──────────────────────────────────────────────────┐
+   │  NCD governs?  → NCD                               │
+   │  silent/defers → state→MAC → MAC-filtered LCD RAG  │
+   │  neither       → none ("idk")                      │
+   └───────────────┬───────────────────┬───────────────┘
+                   ▼                    ▼
+         ┌──────────────────┐  ┌──────────────────────────┐
+         │  Policy Q&A      │  │  Gap Analysis            │
+         │  answer from the │  │  governing policy (NCD   │
+         │  governing policy│  │  or LCD) vs PubMed →     │
+         │  (cited)         │  │  structured gap report   │
+         └─────────┬────────┘  └────────────┬─────────────┘
+                   ▼                         ▼
+   ┌──────────────────────────────────────────────────────┐
+   │  Streamlit UI (auto-routes Q&A vs gap; multi-turn     │
+   │  state ask) · JSONL logs · eval harness               │
+   └──────────────────────────────────────────────────────┘
 ```
 
 ### Model roles
 
 | Model | Provider | Role |
 |---|---|---|
-| `gemini-2.5-flash` | Google AI | Policy answer generation · **gap report synthesis** · **NCD disambiguation** · independent gap reference labeling · RAGAS judge |
-| `llama-3.1-8b-instant` | Groq | Synthetic question generation (Policy Q&A + gap golden sets) |
-| `BAAI/bge-small-en-v1.5` | HuggingFace (local) | Document/query embeddings (both collections) + RAGAS Answer Relevancy |
-| `BAAI/bge-reranker-base` | HuggingFace (local) | Cross-encoder reranking; on the gap side, used only to *identify* the governing NCD |
-
----
-
-## Gap Analysis — how it works
-
-Beyond surface retrieval, the gap pipeline reasons about **where CMS coverage and the evidence diverge**, and maps each verdict to one analyst action.
-
-- **Governing-NCD selection (disambiguation).** NCD-only hybrid retrieval + cross-encoder rerank produce a score-weighted vote per NCD. When the top candidates score close — the case where the rerank argmax is unreliable — **one bounded LLM call reads the question against the candidate NCD titles and picks which policy actually governs** (cap 2). This corrects the primary pick (top-1 accuracy 0.830 → 0.917 on the golden set) and selects a single clean policy, lifting recall *and* cutting cross-policy contamination — something neither a score threshold nor a numbering-hierarchy rule could do.
-- **Whole-NCD context.** The full text of the governing NCD is supplied — not the top-5 question-similar chunks — so the eligibility-criteria section (which separates a *Partial Coverage Gap* from *Aligned*) can never be dropped by chunk ranking.
-- **Topical join for evidence.** PubMed abstracts are pulled *only for the governing NCD(s)* (`source_ncd_number == policy_number`), so evidence and coverage position describe the same intervention. Dense top-12, newest-first, no reranker (bge-reranker isn't trained on clinical text). An empty join yields *Insufficient Evidence*, never unrelated abstracts.
-- **Structured synthesis.** `gemini-2.5-flash` emits a fixed format — CMS Coverage Position · Clinical Evidence (`PMID` bullets, tier-graded T1–T5) · Evidence Grade · Alignment · Gap Summary. The prompt forbids citing un-retrieved PMIDs.
-- **Calibrated label boundaries.** *Partial* requires a **named** excluded population treated with the **same** covered intervention (a different drug/device/program is not this policy's gap). The *Insufficient* gate discards an abstract only as a **name-collision** — a genuinely different intervention sharing a name — never for studying an adjacent population of the same intervention.
-- **Action-oriented alignment.** Aligned (no action) · Partial Coverage Gap (broaden) · Coverage Gap (expand/appeal) · Overcoverage (utilization review) · Insufficient Evidence (manual review).
+| `gemini-2.5-flash` | Google AI | Policy answer + gap-report generation · NCD disambiguation · independent gap labeling · RAGAS judge |
+| `llama-3.1-8b-instant` | Groq (free tier) | Synthetic question generation (Policy Q&A, gap, and LCD eval sets) |
+| `BAAI/bge-small-en-v1.5` | HuggingFace (local) | Document/query embeddings (both collections) |
+| `BAAI/bge-reranker-base` | HuggingFace (local) | Cross-encoder reranking — NCD selection, LCD relevance, governance gates |
 
 ---
 
@@ -87,7 +96,7 @@ Beyond surface retrieval, the gap pipeline reasons about **where CMS coverage an
 
 ### Policy Q&A (RAGAS)
 
-79-question NCD subset (LCDs filtered). Config: k=10, threshold=0.65, reranker top_n=5, hybrid search. Judge: `gemini-2.5-flash`.
+79-question NCD subset, config k=10 / threshold=0.65 / rerank top-5 / hybrid. Judge: `gemini-2.5-flash`.
 
 | Metric | Score | Target |
 |---|:---:|:---:|
@@ -98,35 +107,27 @@ Beyond surface retrieval, the gap pipeline reasons about **where CMS coverage an
 | Citation Accuracy | **0.911** | > 95% |
 | Policy Recall | **0.987** ✅ | > 90% |
 
-### Gap analysis (independent judge)
+### NCD gap analysis (independent judge)
 
-Reference labels come from an **independent `gemini-2.5-flash` labeler** that reads the raw NCD + abstracts — never the pipeline's own report — and are additionally cross-vendor adjudicated by Claude. 276-record golden set.
+Reference labels from an independent `gemini-2.5-flash` labeler (reads raw NCD + abstracts, never the pipeline's report), Claude cross-vendor adjudicated; 276-record golden set. `alignment_accuracy = label_match ∧ ncd_recall`, decomposing failures into retrieval vs reasoning. Full-277 whole-NCD baseline: `alignment_accuracy` 0.542, `kappa` 0.433, `faithfulness` 0.705, `citation_precision` 0.994. The current lean stack (disambiguation + tightened Partial + Insufficient-gate fix) measured **acc 0.520→0.640 on a paired random-25**; a full-277 confirmation run is the next eval.
 
-`alignment_accuracy = label_match ∧ ncd_recall`, so failures decompose into *retrieval* vs *reasoning*.
+### LCD coverage cascade (Phase 3)
 
-| Metric | Measures |
-|---|---|
-| `alignment_accuracy` | End-to-end: right alignment **and** right NCD retrieved |
-| `alignment_label_match` | Raw label agreement (retrieval-blind) |
-| `alignment_kappa` | Quadratic-weighted Cohen's κ on the evidence-vs-coverage direction |
-| `alignment_action_match` | Provider action bucket: appeal / covered / manual |
-| `ncd_recall` | Governing NCD surfaced and selected |
-| `pmid_recall` / `pmid_recall_retrieved` | Reference-PMID citation recall (overall / over retrieved) |
-| `citation_precision` | Cited PMIDs that were actually retrieved (fabrication guard) |
-| `faithfulness` | RAGAS faithfulness vs policy + PubMed contexts |
+`generate_golden_lcd.py` writes a lay coverage question per sampled LCD (12/MAC) and pairs it with a state in that jurisdiction; `judge_lcd.py` runs the cascade and scores resolution (no API cost).
 
-**Where it stands.** The last full 277-record benchmark of the whole-NCD pipeline scored `alignment_accuracy` 0.542, `kappa` 0.433, `faithfulness` 0.705, `ncd_recall` 0.888 (`citation_precision` 0.994 = effectively zero fabrication). The current build then added three changes — the **disambiguation step**, a tightened **Partial** boundary, and an **Insufficient-gate** precision fix:
+| Metric (n=60) | Value |
+|---|:---:|
+| `lcd_precision` (right LCD when it picks one) | **0.94** |
+| `lcd_recall` (resolved to the correct LCD) | **0.783** |
+| disposition | lcd 50 · ncd 7 · none 3 |
 
-- NCD selection (LLM-free backtest, n=277): top-1 **0.830 → 0.917**, `ncd_recall` **0.888 → 0.921**, multi-policy contamination **26% → 0.7%**.
-- Paired representative sample (seeded-random 25, same records old vs new): `alignment_accuracy` **0.520 → 0.640**, `ncd_recall` **0.800 → 0.880**.
-
-A full 277-record re-eval of the current stack is the next step; the random-25 predicts it clears the prior 0.570 baseline.
+7 of the "misses" are services with a national NCD (cascade correctly returns the NCD); excluding those, LCD-applicable recall is **0.887**. A gate sweep (`scripts/sweep_lcd_gates.py`, no API cost) validated the two soft gates: `SILENT_GATE`=0.60 (stable [0.58, 0.65]) and `LCD_GATE`=0.55 (precision-optimal). **Known limit:** ~half the LCDs have broad titles ("Plastic Surgery"), so per-title evidence fetch yields nothing focused → those gaps return Insufficient.
 
 ```bash
-python -m src.ingestion.fetch_pubmed          # fetch PubMed abstracts
-python -m src.rag.pubmed_indexer              # build pubmed_evidence collection
-python -m src.evaluation.generate_golden_gap  # independent reference labels
-python -m src.evaluation.judge_gap            # score the gap pipeline
+python -m src.evaluation.judge           # RAGAS — Policy Q&A
+python -m src.evaluation.judge_gap       # NCD gap analysis
+python -m src.evaluation.generate_golden_lcd  # build the LCD eval set (Groq)
+python -m src.evaluation.judge_lcd       # LCD cascade eval (no API cost)
 ```
 
 ---
@@ -136,68 +137,55 @@ python -m src.evaluation.judge_gap            # score the gap pipeline
 ```
 src/
 ├── ingestion/
-│   ├── fetch.py              # CMS Coverage API client — NCDs + LCDs
-│   └── fetch_pubmed.py       # PubMed via NCBI E-utilities (two-pass primary-evidence)
+│   ├── fetch.py              # CMS API: NCDs + LCDs (fetch_lcds_for_macs, MAC tagging)
+│   └── fetch_pubmed.py       # PubMed via NCBI; per-NCD and per-LCD topical evidence
 ├── rag/
-│   ├── embedder.py           # HuggingFace embedding wrapper
-│   ├── indexer.py            # ChromaDB build/load — cms_coverage collection
-│   ├── pubmed_indexer.py     # ChromaDB build/load — pubmed_evidence collection
-│   └── pipeline.py           # Hybrid retrieval, rerank, NCD disambiguation,
-│                             #   generation, gap_analysis
+│   ├── embedder.py           # bge-small embeddings
+│   ├── indexer.py            # cms_coverage build/load (NCD + LCD bodies, mac flags)
+│   ├── pubmed_indexer.py     # pubmed_evidence build/load
+│   └── pipeline.py           # retrieval, rerank, NCD disambiguation, jurisdiction
+│                             #   routing, NCD→LCD cascade, answer(), gap_analysis()
 ├── evaluation/
-│   ├── generate_golden.py        # Synthetic Policy Q&A dataset
-│   ├── generate_golden_gap.py    # Independent gap reference labels
-│   ├── judge.py                  # RAGAS evaluation — Policy Q&A
-│   └── judge_gap.py              # Gap analysis evaluation
+│   ├── generate_golden.py / generate_golden_gap.py / generate_golden_lcd.py
+│   └── judge.py / judge_gap.py / judge_lcd.py
 └── ui/
-    └── app.py                # Streamlit UI — auto-routes Q&A vs gap
+    └── app.py                # Streamlit — auto-routes Q&A vs gap, multi-turn state
 
-scripts/                      # one-off analysis: NCD-selection sweeps + backtests,
-                              #   paired random-N gap eval
-
-data/   chroma/  → cms_coverage (1,983 chunks) + pubmed_evidence (3,219 abstracts)
-        (golden_gap.json, gap_questions.json, pubmed_raw.json are gitignored)
-logs/   eval_*.jsonl/json, answer caches, interactions.jsonl  (gitignored)
+scripts/                      # eval/analysis: gap random-N eval, LCD gate sweep
+data/   chroma/  (Git LFS)  → cms_coverage (1,483 NCD + 10,668 LCD) + pubmed_evidence (5,735)
 ```
 
 ---
 
 ## Setup
 
-**Prerequisites:** Python 3.11+, a Google AI API key (paid tier recommended).
+**Prerequisites:** Python 3.11+, Git LFS, a Google AI API key (paid tier recommended), a Groq key (eval generation only).
 
 ```bash
-# 1. virtual environment
+git lfs install && git clone <repo>     # LFS pulls the prebuilt index
 python -m venv agent
-agent\Scripts\activate        # Windows
-source agent/bin/activate     # macOS / Linux
-
-# 2. dependencies
+agent\Scripts\activate                  # Windows  (source agent/bin/activate on *nix)
 pip install -r requirements.txt
 ```
 
-Create a `.env` in the project root:
+Create `.env` (or set Streamlit Cloud secrets):
 
 ```
 GOOGLE_API_KEY=your_google_api_key_here
-GROQ_API_KEY=your_groq_api_key_here   # only for question generation
+GROQ_API_KEY=your_groq_api_key_here     # eval question generation only
 ```
 
-**Build the policy index (Policy Q&A):**
+The vector index ships in the repo via **Git LFS** — no rebuild needed to run or deploy. To rebuild from scratch:
 
 ```bash
-python -m src.ingestion.fetch       # fetch NCDs + LCDs (~2–3 min)
-python -m src.rag.indexer           # chunk, embed, persist cms_coverage
+python -m src.ingestion.fetch                       # NCDs + LCDs
+python -m src.ingestion.fetch_pubmed                # per-NCD evidence
+python -m src.ingestion.fetch_pubmed --lcd          # per-LCD evidence
+python -m src.rag.indexer                           # cms_coverage (NCD + LCD)
+python -m src.rag.pubmed_indexer                    # pubmed_evidence
 ```
 
-**Build the evidence index (Gap Analysis):**
-
-```bash
-python -m src.ingestion.fetch_pubmed   # fetch abstracts per NCD topic
-python -m src.rag.pubmed_indexer       # persist pubmed_evidence
-```
-
-**Launch the UI:**
+Launch:
 
 ```bash
 streamlit run src/ui/app.py
@@ -210,5 +198,4 @@ streamlit run src/ui/app.py
 | Variable | Required | Description |
 |---|---|---|
 | `GOOGLE_API_KEY` | Yes | Policy answers · gap synthesis · NCD disambiguation · gap labeling · RAGAS judge |
-| `GROQ_API_KEY` | Question generation only | Synthetic Policy Q&A + gap question sets |
-```
+| `GROQ_API_KEY` | Eval generation only | Synthetic question generation (Q&A / gap / LCD eval sets) |
