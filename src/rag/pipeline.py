@@ -482,7 +482,10 @@ _DEFER_RE = re.compile(
     re.I,
 )
 
-# Top reranked-chunk sigmoid below these ⇒ nothing on-topic governs.
+# Top reranked-chunk sigmoid below these ⇒ nothing on-topic governs. Eval-validated
+# on the LCD set (scripts/sweep_lcd_gates.py): SILENT_GATE stable in [0.58, 0.65]
+# (0.55 over-fires NCD governance); LCD_GATE=0.55 is the precision-optimal point
+# (0.94) — lowering to 0.50 buys ~2pts recall but turns "verify" into wrong-LCD.
 SILENT_GATE = 0.60   # NCD side (governed ~0.73 vs LCD-only ~0.55)
 LCD_GATE = 0.55      # LCD side: no MAC LCD relevant enough → contractor discretion
 
