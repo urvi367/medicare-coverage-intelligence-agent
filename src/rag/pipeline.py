@@ -346,9 +346,14 @@ logger = logging.getLogger(__name__)
 
 _BASE_SYSTEM = (
     "You are a Medicare coverage policy expert. Answer questions using ONLY the "
-    "retrieved policy documents below. For every claim, cite the document title and "
-    "policy number. If the documents do not contain enough information to answer "
-    "confidently, say so explicitly."
+    "retrieved policy documents below, and state ONLY criteria, limitations, "
+    "diagnoses, and conditions that appear explicitly in the document text. Do NOT "
+    "infer, generalize, paraphrase into new requirements, or add any coverage "
+    "criterion that is not written there — if a detail the question asks about is "
+    "not stated, say it is not specified in the policy rather than supplying a "
+    "plausible answer. For every claim, cite the document title and policy number. "
+    "If the documents do not contain enough information to answer confidently, say "
+    "so explicitly."
 )
 
 _LCD_ADDENDUM = (
@@ -550,11 +555,25 @@ def _denoise(question: str, state_code: str) -> str:
     return s or question
 
 
+def _top_chunks(query: str, docs: list[Document], top_n: int) -> list[Document]:
+    """The top_n most question-relevant chunks of one resolved policy.
+
+    Policy Q&A and gap analysis share *which* policy governs but need different context:
+    Q&A wants the focused chunks that answer this question (grounded, less boilerplate),
+    gap analysis wants the whole document (no scattered criterion missed). This builds
+    the focused view by reranking the policy's own chunks against the question.
+    """
+    if not docs:
+        return []
+    return [d for _, d in _rerank_scored(query, docs, top_n=top_n)]
+
+
 @dataclass
 class ResolvedPolicy:
     """The single governing policy for a question (or none)."""
     source: str                                   # "ncd" | "lcd" | "none"
-    policy_docs: list[Document] = field(default_factory=list)
+    policy_docs: list[Document] = field(default_factory=list)    # whole document — gap analysis
+    policy_chunks: list[Document] = field(default_factory=list)  # focused chunks — Policy Q&A
     policy_ids: list[str] = field(default_factory=list)
     title: str = ""
     mac: str | None = None
@@ -583,7 +602,9 @@ def resolve_governing_policy(
             docs = [d for n in primary for d in _full_ncd_docs(n)]
             if ncd_disposition("\n".join(d.page_content for d in docs)) == "governs":
                 return ResolvedPolicy(
-                    source="ncd", policy_docs=docs, policy_ids=list(primary),
+                    source="ncd", policy_docs=docs,
+                    policy_chunks=_top_chunks(question, docs, top_n),
+                    policy_ids=list(primary),
                     title=docs[0].metadata.get("title", "") if docs else "",
                 )
             # NCD exists but defers to local contractors → fall through to LCD
@@ -605,7 +626,9 @@ def resolve_governing_policy(
     top_lcd = lcd_ranked[0][1].metadata.get("policy_number", "")
     docs = _full_lcd_docs(top_lcd)  # whole-LCD context for the governing LCD
     return ResolvedPolicy(
-        source="lcd", policy_docs=docs, policy_ids=[top_lcd],
+        source="lcd", policy_docs=docs,
+        policy_chunks=_top_chunks(lcd_q, docs, top_n),
+        policy_ids=[top_lcd],
         title=docs[0].metadata.get("title", "") if docs else "", mac=mac,
     )
 
@@ -654,7 +677,9 @@ def answer(
         }
 
     llm = ChatGoogleGenerativeAI(model=model, temperature=0)
-    sources: list[Document] = resolved.policy_docs
+    # Policy Q&A uses the focused, reranked chunks of the governing policy (grounded,
+    # less boilerplate); gap analysis uses resolved.policy_docs (the whole document).
+    sources: list[Document] = resolved.policy_chunks or resolved.policy_docs
     context = _format_docs(sources)
     prompt = ChatPromptTemplate.from_messages(
         [("system", _build_system(sources, mac=resolved.mac)), ("human", "{question}")]
