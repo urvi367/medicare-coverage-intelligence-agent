@@ -21,3 +21,4 @@ data/_*.log
 scripts/_*.txt
 
 data/golden_lcd.json
+data/lcd_faith_answers.json

@@ -120,9 +120,9 @@ Reference labels from an independent `gemini-2.5-flash` labeler (reads raw NCD +
 | `lcd_precision` — right LCD when it picks one (n=60) | **0.94** |
 | `lcd_recall` — resolved to the correct LCD (n=60) | **0.783** |
 | disposition (n=60) | lcd 50 · ncd 7 · none 3 |
-| `lcd_faithfulness` — answer grounded in the LCD body (n=15) | **0.655** |
+| `lcd_faithfulness` — answer grounded in the LCD body (n=15) | **0.843** |
 
-7 of the "misses" are services with a national NCD (cascade correctly returns the NCD); excluding those, LCD-applicable recall is **0.887**. A gate sweep (`scripts/sweep_lcd_gates.py`, no API cost) validated the two soft gates: `SILENT_GATE`=0.60 (stable [0.58, 0.65]) and `LCD_GATE`=0.55 (precision-optimal). **Generation faithfulness 0.655 trails the NCD policy answer (0.854)** — LCD bodies are long and boilerplate-heavy, so answers extrapolate coverage criteria more; a real quality gap to tighten. **Known limit:** ~half the LCDs have broad titles ("Plastic Surgery"), so per-title evidence fetch yields nothing focused → those gaps return Insufficient.
+7 of the "misses" are services with a national NCD (cascade correctly returns the NCD); excluding those, LCD-applicable recall is **0.887**. A gate sweep (`scripts/sweep_lcd_gates.py`, no API cost) validated the two soft gates: `SILENT_GATE`=0.60 (stable [0.58, 0.65]) and `LCD_GATE`=0.55 (precision-optimal). **Generation faithfulness is 0.843 — on par with the NCD policy answer (0.854)**, so LCD answers don't invent criteria. (The raw RAGAS score is 0.646; the gap is a measurement artifact — LCD answers are *required* to open with a jurisdiction disclaimer that is true but not in the LCD body, so RAGAS flags it as ungrounded on every answer. Excluding that mandated preamble, grounding is 0.843; run `judge_lcd --faithfulness`.) **Known limit:** ~half the LCDs have broad titles ("Plastic Surgery"), so per-title evidence fetch yields nothing focused → those gaps return Insufficient.
 
 ```bash
 python -m src.evaluation.judge           # RAGAS — Policy Q&A
