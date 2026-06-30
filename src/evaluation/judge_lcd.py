@@ -16,6 +16,9 @@ Usage: python -m src.evaluation.judge_lcd
 import collections
 import json
 import logging
+import random
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +63,61 @@ def evaluate(n_samples: int | None = None) -> dict[str, Any]:
     return scores, misses
 
 
+def evaluate_faithfulness(sample_size: int = 20, n_faith: int = 15, seed: int = 42) -> dict[str, Any]:
+    """RAGAS faithfulness of LCD-resolved answers vs the LCD body (reference-free).
+
+    Costs API: generates the answer (Gemini) for a random sample, keeps the ones that
+    resolve to an LCD, and scores up to n_faith with the RAGAS faithfulness judge —
+    "does the LCD answer invent coverage criteria not in the LCD body?"
+    """
+    from unittest.mock import MagicMock
+    # ragas imports a Vertex chat model that isn't present in this langchain version
+    sys.modules.setdefault("langchain_community.chat_models.vertexai", MagicMock())
+
+    import pandas as pd
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    from ragas import EvaluationDataset, SingleTurnSample, evaluate as ragas_evaluate
+    from ragas.llms import LangchainLLMWrapper
+    from ragas.metrics._faithfulness import Faithfulness
+
+    from src.rag.pipeline import answer
+
+    golden = json.loads(GOLDEN_LCD_PATH.read_text(encoding="utf-8"))
+    sample = random.Random(seed).sample(golden, min(sample_size, len(golden)))
+
+    items = []
+    for i, r in enumerate(sample, 1):
+        res = answer(r["question"], state=r["state"])
+        srcs = res.get("sources", [])
+        if srcs and srcs[0].metadata.get("source") == "LCD":
+            items.append({"q": r["question"], "a": res["answer"],
+                          "ctx": [d.page_content for d in srcs]})
+        logger.info("  generated %d/%d (LCD-resolved so far: %d)", i, len(sample), len(items))
+    if len(items) > n_faith:
+        items = items[:n_faith]
+    if not items:
+        return {"lcd_faithfulness": None, "n_faith": 0}
+
+    llm = LangchainLLMWrapper(
+        ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0), bypass_n=True)
+    dfs = []
+    for i, it in enumerate(items, 1):
+        logger.info("  faithfulness %d/%d", i, len(items))
+        ds = EvaluationDataset(samples=[SingleTurnSample(
+            user_input=it["q"], response=it["a"], retrieved_contexts=it["ctx"])])
+        for attempt in range(8):
+            try:
+                dfs.append(ragas_evaluate(ds, metrics=[Faithfulness(llm=llm)]).to_pandas())
+                break
+            except Exception as e:
+                if attempt == 7 or not any(t in str(e) for t in ("429", "RESOURCE_EXHAUSTED", "503")):
+                    raise
+                time.sleep(min(2 ** attempt * 5 + 1, 90))
+    df = pd.concat(dfs, ignore_index=True)
+    return {"lcd_faithfulness": round(float(df["faithfulness"].mean(skipna=True)), 3),
+            "n_faith": len(items)}
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     scores, misses = evaluate()
@@ -69,3 +127,8 @@ if __name__ == "__main__":
     print("\nmisses (expected -> got | question):")
     for exp, got, q in misses[:20]:
         print(f"  {exp:>8} -> {got:<22} {q}")
+
+    if "--faithfulness" in sys.argv:
+        print("\n=== LCD generation faithfulness (RAGAS, reference-free) ===")
+        for k, v in evaluate_faithfulness().items():
+            print(f"  {k}: {v}")
