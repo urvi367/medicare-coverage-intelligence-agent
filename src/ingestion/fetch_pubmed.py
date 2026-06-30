@@ -67,6 +67,46 @@ def _search_topic_pmids(title: str, n: int) -> list[str]:
     return (primary + backfill)[:n]
 
 
+# Canonical PubMed "humans" filter: drops animal-only studies but keeps human AND
+# not-yet-MeSH-indexed records. Broad LCD titles ("Special Histochemical Stains") otherwise
+# collide with veterinary / food-science work; NCD titles are specific so they don't need it.
+_HUMAN_FILTER = "NOT (animals[Mesh:noexp] NOT humans[Mesh:noexp])"
+
+
+def _lcd_core_term(title: str) -> str:
+    """The lead intervention phrase of a long LCD title (text before a ' for/in/of/with…'
+    clause). Long compound LCD titles otherwise pull PubMed relevance toward the trailing
+    disease name (e.g. allogeneic HCT 'for relapsed lymphoma' returns lymphoma-drug trials).
+    Short titles (<= 8 words) are kept whole — their disease term is the point.
+    """
+    if len(title.split()) <= 8:
+        return title
+    head = re.split(r"\s+\b(?:for|in|of|with|due to|associated with|caused by)\b\s+",
+                    title, maxsplit=1, flags=re.I)[0]
+    return head.strip() or title
+
+
+def _search_lcd_pmids(title: str, n: int) -> list[str]:
+    """LCD-scoped search: human studies only, anchored on the core intervention term for
+    long titles, primary evidence first then a human-restricted relevance backfill.
+
+    Fixes the broad-LCD-title failure modes (veterinary collisions, trailing-disease drift,
+    review floods) that title-only search produces. NCD evidence keeps `_search_topic_pmids`
+    so the existing NCD golden set is unaffected.
+    """
+    # ANDed core words (not an exact phrase — "allogeneic stem cell transplant" should still
+    # match) keep relevance on the intervention while excluding the trailing-disease drift.
+    anchor = f"({_lcd_core_term(title)})"
+    primary = _search_pmids(f"{anchor} AND {_PRIMARY_EVIDENCE_FILTER} {_HUMAN_FILTER}", n)
+    if len(primary) >= n:
+        return primary[:n]
+    time.sleep(_DELAY)
+    seen = set(primary)
+    backfill = [p for p in _search_pmids(f"{anchor} {_HUMAN_FILTER}", n + len(primary))
+                if p not in seen]
+    return (primary + backfill)[:n]
+
+
 def _extract_year(article: ElementTree.Element) -> str:
     """Extract a 4-digit publication year from a PubmedArticle element.
 
@@ -367,7 +407,7 @@ def fetch_lcd_evidence(max_per_topic: int = 8) -> Path:
     for i, (lcd_id, title) in enumerate(topics.items(), 1):
         if i % 50 == 0:
             logger.info("  ...%d/%d LCD topics", i, len(topics))
-        for rec in _fetch_abstracts(_search_topic_pmids(title, max_per_topic)):
+        for rec in _fetch_abstracts(_search_lcd_pmids(title, max_per_topic)):
             records.append({**rec, "source_lcd_title": title, "source_lcd_number": lcd_id})
 
     path.write_text(json.dumps(records, indent=2), encoding="utf-8")

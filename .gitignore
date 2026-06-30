@@ -22,3 +22,4 @@ scripts/_*.txt
 
 data/golden_lcd.json
 data/lcd_faith_answers.json
+data/golden_gap_lcd.json
