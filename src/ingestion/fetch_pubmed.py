@@ -83,20 +83,51 @@ _PRIMARY_EVIDENCE_FILTER = (
     "OR Comparative Study[ptyp] OR Cohort Studies[Mesh])"
 )
 
+# For a diagnostic/lab-TEST policy, anchor the search on the TEST's own performance rather
+# than the analyte/disease — otherwise a bare title like "Magnesium" pulls magnesium
+# *supplementation* trials (high study-quality, wrong subject) instead of studies of the
+# magnesium *test*. Applied only when the policy's benefit_category marks it diagnostic.
+_DIAGNOSTIC_ANCHOR = (
+    '("sensitivity and specificity"[MeSH] OR diagnosis[tiab] OR diagnostic[tiab] '
+    'OR sensitivity[tiab] OR specificity[tiab] OR "predictive value"[tiab] '
+    'OR accuracy[tiab] OR screening[tiab] OR measurement[tiab])'
+)
 
-def _search_topic_pmids(title: str, n: int) -> list[str]:
+
+def _is_diagnostic_category(benefit_category: str | None) -> bool:
+    """True only when EVERY benefit_category component is a diagnostic-test category.
+
+    CMS benefit_category is often compound (e.g. "Diagnostic Tests (other), Drugs and
+    Biologicals, Physicians' Services"). A loose substring match would wrongly flag such
+    mixed policies as tests and anchor their search on diagnosis — losing the drug/therapy
+    evidence. Requiring ALL parts to start with "Diagnostic" keeps only the pure
+    diagnostic/lab/x-ray policies (the ones where the analyte-title→therapy-study failure
+    happens) and leaves mixed policies on the normal path.
+    """
+    parts = [p.strip().lower() for p in (benefit_category or "").split(",") if p.strip()]
+    return bool(parts) and all(p.startswith("diagnostic") for p in parts)
+
+
+def _search_topic_pmids(title: str, n: int, diagnostic: bool = False) -> list[str]:
     """PMIDs for a topic, prioritising primary evidence then backfilling to n.
 
     Pass 1 restricts to primary-evidence publication types/subsets; pass 2 backfills any
     shortfall with an unrestricted relevance search so rare or obsolete topics (where no
     primary evidence exists) still return abstracts rather than nothing.
+
+    When diagnostic=True (the policy's benefit_category marks it a diagnostic/lab TEST),
+    the query is anchored on the test's OWN performance (accuracy/screening/measurement),
+    and that anchor is kept on the backfill pass too — so a shortfall is NOT filled with
+    therapy studies. Returning few on-topic abstracts is correct here: the covered service
+    is the test, so treatment studies of the analyte/disease genuinely don't bear on it.
     """
-    primary = _search_pmids(f"({title}) AND {_PRIMARY_EVIDENCE_FILTER}", n)
+    base = f"({title}) AND {_DIAGNOSTIC_ANCHOR}" if diagnostic else f"({title})"
+    primary = _search_pmids(f"{base} AND {_PRIMARY_EVIDENCE_FILTER}", n)
     if len(primary) >= n:
         return primary[:n]
     time.sleep(_DELAY)
     seen = set(primary)
-    backfill = [p for p in _search_pmids(title, n + len(primary)) if p not in seen]
+    backfill = [p for p in _search_pmids(base, n + len(primary)) if p not in seen]
     return (primary + backfill)[:n]
 
 
@@ -297,7 +328,8 @@ def fetch_and_save(max_per_topic: int = 12) -> Path:
     ncd_path = DATA_DIR / "ncd_raw.json"
     ncd_records = json.loads(ncd_path.read_text(encoding="utf-8"))
     topics = [
-        {"title": r["title"], "policy_number": r.get("document_display_id", "")}
+        {"title": r["title"], "policy_number": r.get("document_display_id", ""),
+         "diagnostic": _is_diagnostic_category(r.get("benefit_category"))}
         for r in ncd_records
         if r.get("title")
     ]
@@ -311,7 +343,7 @@ def fetch_and_save(max_per_topic: int = 12) -> Path:
         logger.info("  [%d/%d] %s", i, len(topics), query)
 
         time.sleep(_DELAY)
-        pmids = _search_topic_pmids(topic["title"], max_per_topic)
+        pmids = _search_topic_pmids(topic["title"], max_per_topic, diagnostic=topic["diagnostic"])
         if not pmids:
             continue
 
