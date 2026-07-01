@@ -22,18 +22,51 @@ EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 _DELAY = 0.34  # 3 req/s — NCBI unauthenticated rate limit
 
 _session = requests.Session()
+_last_request = 0.0  # monotonic timestamp of the last NCBI call, for global throttling
 
 
 def _base_params() -> dict:
-    return {"db": "pubmed", "retmode": "json"}
+    # `tool` identifies the client to NCBI (etiquette; reduces throttling).
+    return {"db": "pubmed", "retmode": "json", "tool": "medicare-coverage-agent"}
+
+
+def _eutils_get(url: str, params: dict, timeout: int) -> requests.Response:
+    """GET an E-utilities endpoint with global rate-limiting + retry on 429/5xx.
+
+    A single module-wide throttle spaces EVERY NCBI call by _DELAY (so bulk callers
+    like fetch_lcd_evidence can't burst past the 3 req/s limit), and transient 429/5xx
+    responses are retried with backoff instead of silently returning no results — the
+    prior silent-empty behavior degraded whole topics under load.
+    """
+    global _last_request
+    for attempt in range(6):
+        wait = _DELAY - (time.monotonic() - _last_request)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            r = _session.get(url, params=params, timeout=timeout)
+            _last_request = time.monotonic()
+            if r.status_code in (429, 500, 502, 503):
+                retry_after = float(r.headers.get("Retry-After", 0)) or min(2 ** attempt, 30)
+                logger.warning("NCBI %d — backing off %.1fs (attempt %d/6)", r.status_code, retry_after, attempt + 1)
+                time.sleep(retry_after)
+                continue
+            r.raise_for_status()
+            return r
+        except requests.RequestException as e:
+            _last_request = time.monotonic()
+            if attempt == 5:
+                raise
+            logger.warning("NCBI request error (attempt %d/6): %s", attempt + 1, e)
+            time.sleep(min(2 ** attempt, 30))
+    raise RuntimeError(f"NCBI request failed after retries: {url}")
 
 
 def _search_pmids(query: str, max_results: int = 10) -> list[str]:
     """Return up to max_results PMIDs for query, sorted by relevance."""
     params = {**_base_params(), "term": query, "retmax": max_results, "sort": "relevance"}
     try:
-        r = _session.get(ESEARCH_URL, params=params, timeout=15)
-        r.raise_for_status()
+        r = _eutils_get(ESEARCH_URL, params, timeout=15)
         return r.json()["esearchresult"].get("idlist", [])
     except Exception as e:
         logger.warning("esearch failed for %r: %s", query, e)
@@ -208,8 +241,7 @@ def _fetch_abstracts(pmids: list[str]) -> list[dict[str, Any]]:
     params = {**_base_params(), "id": ",".join(pmids), "rettype": "abstract", "retmode": "xml"}
     params.pop("retmode", None)  # efetch uses rettype, not retmode for XML
     try:
-        r = _session.get(EFETCH_URL, params=params, timeout=30)
-        r.raise_for_status()
+        r = _eutils_get(EFETCH_URL, params, timeout=30)
     except Exception as e:
         logger.warning("efetch failed for pmids %s: %s", pmids[:3], e)
         return []
