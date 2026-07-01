@@ -115,6 +115,101 @@ def _fetch_lcd_detail(item: dict[str, Any], token: str) -> dict[str, Any]:
         return item
 
 
+# ── LCD diagnostic-test classification (for evidence-search anchoring) ──────────
+# LCDs carry no benefit_category (unlike NCDs), so a diagnostic/lab-test LCD is
+# identified by its CPT/HCPCS codes — which live in the associated Billing & Coding
+# ARTICLE, not the LCD (lcd/hcpc-code is empty). Chain: lcd/related-documents →
+# article/hcpc-code. A policy is a diagnostic test when every numeric CPT falls in a
+# diagnostic range and it carries no drug (J/Q) code. Ranges validated on the golden
+# LCD set: flags magnesium/HbA1c/SSEP + other real tests, excludes every therapy.
+_DIAGNOSTIC_CPT_RANGES = [
+    (70010, 76999),  # diagnostic radiology (77xxx radiation therapy excluded)
+    (78012, 78999),  # diagnostic nuclear medicine (79xxx therapy excluded)
+    (80047, 89398),  # pathology & laboratory
+    (92002, 92287),  # ophthalmology diagnostic (92310+ lenses/therapy excluded)
+    (93000, 93356),  # cardiovascular diagnostic (93797+ cardiac rehab excluded)
+    (94002, 94799),  # pulmonary function testing
+    (95700, 96020),  # neuro diagnostic: EEG/EMG/evoked potentials/sleep/autonomic
+]
+
+
+def _is_diagnostic_hcpc(codes: list[str]) -> bool:
+    """True when a code set marks a pure diagnostic/lab test.
+
+    Requires >=1 numeric 5-digit CPT, ALL numeric CPTs in a diagnostic range, and no
+    HCPCS drug code (J/Q, = pharmacological therapy). Any procedure/therapy CPT (e.g.
+    64450 nerve block, 97xxx PT) fails the all-diagnostic test, keeping mixed policies out.
+    """
+    nums: list[int] = []
+    for c in codes:
+        c = str(c).strip().upper()
+        if c[:1] in ("J", "Q"):          # HCPCS drug code → pharmacological therapy
+            return False
+        if c.isdigit() and len(c) == 5:
+            nums.append(int(c))
+    if not nums:
+        return False
+    return all(any(lo <= n <= hi for lo, hi in _DIAGNOSTIC_CPT_RANGES) for n in nums)
+
+
+def _lcd_hcpc_codes(doc_id: int, ver: int, token: str) -> list[str]:
+    """All CPT/HCPCS codes for an LCD via its related Billing & Coding article(s).
+
+    CMS keeps coding on the article, not the LCD, so follow lcd/related-documents →
+    article/hcpc-code, unioning codes across the related articles.
+    """
+    H = {"Authorization": f"Bearer {token}"}
+    r = _session.get(f"{BASE}/data/lcd/related-documents",
+                     params={"lcdid": doc_id, "ver": ver}, headers=H, timeout=30)
+    r.raise_for_status()
+    arts = [(row["r_article_id"], row["r_article_version"])
+            for row in r.json().get("data", []) if row.get("r_article_id")]
+    codes: set[str] = set()
+    for aid, aver in arts:
+        rr = _session.get(f"{BASE}/data/article/hcpc-code",
+                          params={"articleid": aid, "ver": aver}, headers=H, timeout=30)
+        if rr.status_code == 200:
+            codes.update(str(x["hcpc_code_id"]) for x in rr.json().get("data", []))
+    return sorted(codes)
+
+
+def build_lcd_diagnostic_map() -> Path:
+    """Classify every active LCD as diagnostic-test or not, from its article CPT codes.
+
+    Saves data/lcd_diagnostic.json ({display_id: {diagnostic, codes}}). Resumable;
+    consumed by fetch_lcd_evidence to anchor diagnostic LCDs' PubMed search on the test.
+    """
+    import time
+    lcds = json.loads((DATA_DIR / "lcd_raw.json").read_text(encoding="utf-8"))
+    active = [r for r in lcds if r.get("document_display_id")
+              and (r.get("retirement_date") or "N/A").strip() == "N/A"]
+    out_path = DATA_DIR / "lcd_diagnostic.json"
+    result: dict[str, Any] = json.loads(out_path.read_text(encoding="utf-8")) if out_path.exists() else {}
+    logger.info("Classifying %d active LCDs (%d already cached)...", len(active), len(result))
+
+    token = _get_license_token()
+    for i, r in enumerate(active, 1):
+        did = r["document_display_id"]
+        if did in result:
+            continue
+        try:
+            codes = _lcd_hcpc_codes(r["document_id"], r["document_version"], token)
+        except Exception as e:
+            logger.warning("LCD %s codes failed: %s", did, e)
+            continue
+        result[did] = {"diagnostic": _is_diagnostic_hcpc(codes), "codes": codes}
+        if i % 25 == 0:
+            out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+            logger.info("  ...%d/%d (%d diagnostic so far)", i, len(active),
+                        sum(1 for v in result.values() if v["diagnostic"]))
+        time.sleep(0.15)
+
+    out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    ndiag = sum(1 for v in result.values() if v["diagnostic"])
+    logger.info("Saved %d LCD classifications (%d diagnostic) → %s", len(result), ndiag, out_path)
+    return out_path
+
+
 def fetch_and_save(doc_type: str, max_docs: int = 500) -> Path:
     """Fetch doc_type ('ncd' or 'lcd') list + full text and save to data/{doc_type}_raw.json.
 

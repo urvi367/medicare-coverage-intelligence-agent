@@ -150,17 +150,24 @@ def _lcd_core_term(title: str) -> str:
     return head.strip() or title
 
 
-def _search_lcd_pmids(title: str, n: int) -> list[str]:
+def _search_lcd_pmids(title: str, n: int, diagnostic: bool = False) -> list[str]:
     """LCD-scoped search: human studies only, anchored on the core intervention term for
     long titles, primary evidence first then a human-restricted relevance backfill.
 
     Fixes the broad-LCD-title failure modes (veterinary collisions, trailing-disease drift,
     review floods) that title-only search produces. NCD evidence keeps `_search_topic_pmids`
     so the existing NCD golden set is unaffected.
+
+    When diagnostic=True (the LCD's CPT codes mark it a diagnostic/lab TEST — see
+    fetch.build_lcd_diagnostic_map), the query also carries `_DIAGNOSTIC_ANCHOR` so a bare
+    analyte title like "Magnesium" pulls studies of the test, not the analyte-as-therapy.
+    The anchor is kept on the backfill pass too, so a shortfall isn't filled with therapy.
     """
     # ANDed core words (not an exact phrase — "allogeneic stem cell transplant" should still
     # match) keep relevance on the intervention while excluding the trailing-disease drift.
     anchor = f"({_lcd_core_term(title)})"
+    if diagnostic:
+        anchor = f"{anchor} AND {_DIAGNOSTIC_ANCHOR}"
     primary = _search_pmids(f"{anchor} AND {_PRIMARY_EVIDENCE_FILTER} {_HUMAN_FILTER}", n)
     if len(primary) >= n:
         return primary[:n]
@@ -464,6 +471,16 @@ def fetch_lcd_evidence(max_per_topic: int = 8) -> Path:
             topics[did] = r["title"]
     logger.info("Fetching PubMed for %d LCD topics (max %d each)...", len(topics), max_per_topic)
 
+    # Per-LCD diagnostic flag (from CPT codes, fetch.build_lcd_diagnostic_map) — diagnostic
+    # LCDs anchor their search on the test. Absent map → all False (plain search, no change).
+    diag_path = DATA_DIR / "lcd_diagnostic.json"
+    diag_map: dict[str, bool] = {}
+    if diag_path.exists():
+        diag_map = {k: bool(v.get("diagnostic")) for k, v in
+                    json.loads(diag_path.read_text(encoding="utf-8")).items()}
+        logger.info("  loaded LCD diagnostic map: %d of %d marked diagnostic",
+                    sum(diag_map.values()), len(diag_map))
+
     path = DATA_DIR / "pubmed_raw.json"
     records = json.loads(path.read_text(encoding="utf-8"))
     records = [r for r in records if not r.get("source_lcd_number")]  # idempotent re-run
@@ -471,7 +488,8 @@ def fetch_lcd_evidence(max_per_topic: int = 8) -> Path:
     for i, (lcd_id, title) in enumerate(topics.items(), 1):
         if i % 50 == 0:
             logger.info("  ...%d/%d LCD topics", i, len(topics))
-        for rec in _fetch_abstracts(_search_lcd_pmids(title, max_per_topic)):
+        pmids = _search_lcd_pmids(title, max_per_topic, diagnostic=diag_map.get(lcd_id, False))
+        for rec in _fetch_abstracts(pmids):
             records.append({**rec, "source_lcd_title": title, "source_lcd_number": lcd_id})
 
     path.write_text(json.dumps(records, indent=2), encoding="utf-8")
